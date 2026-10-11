@@ -183,6 +183,8 @@ Music 总是按设备当前标称采样率渲染，自己不切。App 得知"新
 
 与 LosslessSwitcher（只看日志、曲目开始后才切真实 DAC，开头错误采样率 + 断音）和 Nativerate（以 AppleScript 为准，仅在"有损起播 → 无损"时从当前位置再切一次；AppleScript 报低规格时不会纠正）相比，这套规则针对的正是起播段问题。
 
+**Rate Library（0.4.0，借鉴 Lysoniq Switcher）**：播过的曲目持久记住实测格式（`~/Library/Application Support/ScreamMusic/RateLibrary.json`）。键为 AppleScript 的 persistent ID（流媒体没有时用规范化"艺人 — 专辑 — 曲名"）。学习规则：曲目在当前格式下连续干净 ≥ 10 s → 记住；网格检查纠正过 → 记纠正后的格式；有损（AAC）/ Atmos → 记 lossy，以后不再追逐。使用规则：手动开始命中库 → 不再等解码器日志直接切；自然衔接时库优先于预读日志；库无条目时同专辑其他曲目的最常见格式作为网格候选。参考 Lysoniq Switcher 的 Rate Library；其 Relock Time/Pause Point（等 DAC 物理重锁）与 RP/KF 播放项日志关联（私有日志）不采用。AAC（`ACMP4AACBaseDecoder`）与 Atmos（`ACDDPAtmosDecoder`）日志单独识别：有损/渲染内容永远不在网格上，网格检查不动作，面板标注。
+
 #### 6.2.3 截住与丢弃（驱动）
 
 Nativerate 需要在 App 里维护约 0.35 s 的环形缓冲才能在错误片段到达 DAC 前截住它。ScreamMusic 的驱动在发 UDP 前本来就有发送缓冲，因此截住/丢弃放在驱动里，错误采样率的数据根本不离开 Mac：

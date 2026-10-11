@@ -36,6 +36,7 @@ Original 只发 32 位 PCM。Extended 按曲目发 16 / 24 / 32 位。
 - 立体声，仅 UDP。采样率 44.1–384 kHz。
 - Music 音量 100，声音检查、均衡器、歌曲过渡、杜比全景声关掉，格式才是 bit-perfect。
 - Apple Music 流媒体开头一两秒可能是低规格起播段。同采样率切歌无缝；换采样率时，接收端或 DAC 重锁时钟可能咔一下。
+- 播过的曲目会记住实测格式（Rate Library，存在 `~/Library/Application Support/ScreamMusic/`），第二次播放零等待、零误切。Advanced 里可以清空。
 - 菜单栏图标若被收起，再双击 App 会弹出窗口。
 
 从源码构建：`./build.sh`，产物 `build/ScreamMusic.app`。设计笔记见 `DESIGN.md`。

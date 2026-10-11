@@ -18,6 +18,17 @@ final class MusicScripts {
     private let stateScript = compile("tell application \"Music\" to get player state as string")
     private let eqScript = compile("tell application \"Music\" to get EQ enabled")
     private let trackRateScript = compile("tell application \"Music\" to get {name, sample rate} of current track")
+    private let trackInfoScript = compile("""
+        tell application "Music"
+            if player state is stopped then return {}
+            set t to current track
+            set p to ""
+            try
+                set p to persistent ID of t
+            end try
+            return {name of t, sample rate of t, p, artist of t, album of t}
+        end tell
+        """)
 
     private static func compile(_ source: String) -> NSAppleScript? {
         let s = NSAppleScript(source: source)
@@ -51,6 +62,18 @@ final class MusicScripts {
         guard let d = run(trackRateScript), d.numberOfItems >= 2 else { return nil }
         let r = d.atIndex(2).map { $0.doubleValue } ?? 0
         return (d.atIndex(1)?.stringValue ?? "", r > 0 ? r : nil)
+    }
+
+    /// {name, sample rate, persistent ID, artist, album} of the current track. Streams have no
+    /// persistent ID (""); Music may read "missing value" for the rate right at a change.
+    func trackInfo() -> (name: String, rate: Double?, persistentID: String, artist: String, album: String)? {
+        guard let d = run(trackInfoScript), d.numberOfItems >= 5 else { return nil }
+        let r = d.atIndex(2).map { $0.doubleValue } ?? 0
+        return (d.atIndex(1)?.stringValue ?? "",
+                r > 0 ? r : nil,
+                d.atIndex(3)?.stringValue ?? "",
+                d.atIndex(4)?.stringValue ?? "",
+                d.atIndex(5)?.stringValue ?? "")
     }
 
     @discardableResult func setPosition(_ p: Double) -> Bool {

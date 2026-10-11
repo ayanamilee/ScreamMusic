@@ -34,14 +34,19 @@
 import AppKit
 import CoreAudio
 import Foundation
+import ScreamMusicKit
 
 struct FollowerState: Equatable {
     var trackName = ""
     var trackRate: Double?
     var trackBits: Int?
     var lossless = true
+    var atmos = false
+    /// where the format came from: "rate library", "pre-roll", "its decoder line", "Music's rate", ...
+    var source = ""
     var lastAction = ""
     var switches = 0
+    var libraryCount = 0
 }
 
 final class RateFollower: @unchecked Sendable {
@@ -81,6 +86,13 @@ final class RateFollower: @unchecked Sendable {
     private var gridFixes = 0
     private var gridTried: [Fmt] = []
     private var formatChangedAt = Date.distantPast
+    /// The playing track's Rate Library key (nil: not identified).
+    private var currentKey: String?
+    /// The current track is lossy (AAC) or Atmos: the grid check stays out, the library learns lossy.
+    private var trackLossy = false
+    private var trackAtmos = false
+    /// Learning: frames of clean windows since the last format change / track start.
+    private var learnCleanFrames = 0
 
     struct Fmt: Equatable {
         var rate: Double
@@ -112,6 +124,7 @@ final class RateFollower: @unchecked Sendable {
             let at = Date()
             self?.q.async { self?.handleInfo(info, at: at) }
         }
+        RateLibrary.shared.onError = { elog($0) }
         gridTick()
         q.async { [self] in
             curRate = ScreamDevice.nominalRate(device) ?? 44100
@@ -137,6 +150,7 @@ final class RateFollower: @unchecked Sendable {
         logProcess = nil
         q.sync {
             stopped = true
+            finalizeLearning()
             armSerial += 1
             ScreamDevice.setInt(device, ScreamDevice.hold, ScreamDevice.Hold.run.rawValue)
             armed = .run
@@ -214,6 +228,7 @@ final class RateFollower: @unchecked Sendable {
     }
 
     private func newTrack(name: String, id: Int64?, at: Date) {
+        finalizeLearning()
         lastTrackID = id
         let prev = lastNewTrackAt
         let prevOwn = ownLinesUntil
@@ -226,13 +241,32 @@ final class RateFollower: @unchecked Sendable {
         gridBad = 0
         gridFixes = 0
         gridTried = []
+        trackLossy = false
+        trackAtmos = false
+        learnCleanFrames = 0
         state.trackName = name
 
         // The next track's pre-roll: lossless lines after the previous track's own window (a stream can
         // show both its variants there). With one, this is a natural transition: decide now.
         let afterPrev = prev.map { $0.addingTimeInterval(Self.trackWindow) } ?? .distantPast
         let preRoll = lines.filter { $0.date > afterPrev && $0.date > (prevOwn ?? .distantPast) && $0.date <= at && $0.lossless && $0.bits != nil }
-        let scriptRate = musicTrackRate(name: name)
+        let info = musicTrackInfo(name: name)
+        let scriptRate = info?.rate
+        if let key = info?.key {
+            currentKey = key
+            // The library has confirmed formats from actual plays; pre-roll lines and Music's own rate
+            // have both been wrong (streams settling on another variant), so it wins.
+            if let learned = RateLibrary.shared.lookup(key) {
+                let target = Fmt(rate: learned.rate, bits: learned.lossy ? 24 : learned.bits)
+                decide(target, name: name, tPlay: at, how: "rate library", manualStart: preRoll.isEmpty, lossy: learned.lossy)
+                return
+            }
+            // not played before: the album's other tracks are a candidate for the grid check
+            if let hint = info.flatMap({ $0.albumKey }).flatMap({ RateLibrary.shared.albumHint($0) }) {
+                let f = Fmt(rate: hint.rate, bits: hint.bits)
+                if f != Fmt(rate: curRate, bits: curBits) { maybeFormats.append(f) }
+            }
+        }
         if let best = preRoll.compactMap({ fmt(rate: $0.rate, bits: $0.bits) }).reduce(nil, { Fmt.best($0, $1) }) {
             let target = Fmt.best(best, scriptRate.map { Fmt(rate: $0, bits: best.bits) })!
             decide(target, name: name, tPlay: at, how: "pre-roll", manualStart: false)
@@ -261,15 +295,25 @@ final class RateFollower: @unchecked Sendable {
         return Fmt(rate: rate, bits: followDepth ? b : 24)
     }
 
-    /// Music's sample rate for the current track, if it is `name` (~1 s of retries: it reads
-    /// "missing value", or still the previous track, right at a change).
-    private func musicTrackRate(name: String) -> Double? {
+    /// The current track as Music reports it, if it is `name` (~1 s of retries: it reads
+    /// "missing value", or still the previous track, right at a change). Also the track's Rate
+    /// Library key: its persistent ID, else artist — album — name.
+    private func musicTrackInfo(name: String) -> (rate: Double?, key: String?, albumKey: String?)? {
         guard musicRunning() else { return nil }
         for attempt in 0..<6 {
             if attempt > 0 { Thread.sleep(forTimeInterval: 0.15) }
-            guard let t = scripts.trackRate() else { continue }
+            guard let t = scripts.trackInfo() else { continue }
             if !name.isEmpty, t.name != name { continue }
-            if let r = t.rate { return r }
+            let key: String?
+            if !t.persistentID.isEmpty {
+                key = "pid:" + t.persistentID
+            } else {
+                let k = RateLibrary.key(name: t.name, artist: t.artist, album: t.album)
+                key = k.isEmpty ? nil : k
+            }
+            let ak = RateLibrary.albumKey(artist: t.artist, album: t.album)
+            let albumKey: String? = ak.isEmpty ? nil : ak
+            return (t.rate, key, albumKey)
         }
         return nil
     }
@@ -289,19 +333,48 @@ final class RateFollower: @unchecked Sendable {
         guard !stopped, let r = line.range(of: "Input format:") else { return }
         let rest = line[r.upperBound...]
         guard let hz = rest.range(of: #"[0-9]+ Hz"#, options: .regularExpression), let rate = Double(rest[hz].dropLast(3)) else { return }
-        let lossless = line.contains("lac")
+        // codec from the decoder's file name / format tag: alac/qlac = lossless, aac = lossy,
+        // Atmos = rendered (spatial), never bit-perfect as stereo
+        let lossless = line.contains("alac") || line.contains("qlac")
+        let aac = line.contains("aac")
+        let atmos = line.contains("Atmos")
         let bits = rest.range(of: #"from [0-9]+-bit source"#, options: .regularExpression).flatMap { Int(rest[$0].dropFirst(5).prefix { $0.isNumber }) }
         if lines.last?.rate != rate || lines.last?.bits != bits || at.timeIntervalSince(lines.last!.date) > 0.5 {
-            elog("decoder: \(Int(rate)) Hz\(bits.map { " \($0)-bit" } ?? "") (\(lossless ? "lossless" : "lossy"))")
+            elog("decoder: \(Int(rate)) Hz\(bits.map { " \($0)-bit" } ?? "") (\(atmos ? "atmos" : lossless ? "lossless" : aac ? "aac" : "lossy"))")
         }
         lines.append((at, rate, bits, lossless))
         if lines.count > 200 { lines.removeFirst(100) }
         if inSwitch { return }
 
-        let line = lossless ? fmt(rate: rate, bits: bits) : nil
+        if atmos {
+            // rendered output: nothing on the wire can be bit-perfect; note it and leave it alone
+            if playing && !trackAtmos, let started = lastNewTrackAt, at.timeIntervalSince(started) < Self.trackWindow {
+                trackAtmos = true
+                state.atmos = true
+                state.lossless = false
+                publish()
+                elog("decoder: Dolby Atmos rendering for \(state.trackName): not bit-perfect")
+            }
+            return
+        }
+        if aac {
+            // a lossy decoder: the samples are AAC reconstructions, never on the grid. A stream can
+            // start lossy and upgrade to ALAC a few seconds in; its line supersedes this one.
+            if let aw = awaiting {
+                awaiting = nil
+                decide(Fmt(rate: rate, bits: 24), name: aw.name, tPlay: aw.tPlay, how: "its decoder line (AAC)", manualStart: true, lossy: true)
+            } else if playing, let started = lastNewTrackAt, at.timeIntervalSince(started) < Self.trackWindow {
+                trackLossy = true
+                state.lossless = false
+                publish()
+            }
+            return
+        }
+
+        let line = fmt(rate: rate, bits: bits)
 
         if let aw = awaiting {
-            guard let f = line else { return }      // a lossy start or a 'qlac' line: its partner follows
+            guard let f = line else { return }      // a 'qlac' line without the depth: its partner follows
             awaiting = nil
             let target = Fmt.best(f, aw.scriptRate.map { Fmt(rate: $0, bits: f.bits) })!
             decide(target, name: aw.name, tPlay: aw.tPlay, how: "its decoder line", manualStart: true)
@@ -349,11 +422,14 @@ final class RateFollower: @unchecked Sendable {
 
     // MARK: - decisions
 
-    private func decide(_ target: Fmt, name: String, tPlay: Date, how: String, manualStart: Bool) {
+    private func decide(_ target: Fmt, name: String, tPlay: Date, how: String, manualStart: Bool, lossy: Bool = false) {
         trackTarget = target
+        trackLossy = lossy
         state.trackRate = target.rate
         state.trackBits = target.bits
-        state.lossless = true
+        state.lossless = !lossy && !trackAtmos
+        state.source = how
+        state.libraryCount = RateLibrary.shared.count
         let same = target == Fmt(rate: curRate, bits: curBits)
         // a manual start held its first sound while we waited: start the track over rather than send
         // the held audio late (nothing of it has been heard yet)
@@ -392,8 +468,10 @@ final class RateFollower: @unchecked Sendable {
         formatChangedAt = Date()
         gridLast = nil
         gridBad = 0
+        learnCleanFrames = 0
         state.switches += 1
         state.lastAction = "upgraded to \(rateText(curRate)) / \(curBits)-bit"
+        state.source = "grid check"
         elog("  live switch \(state.switches): \(state.trackName) \(why) to \(Int(curRate)) Hz / \(curBits)-bit (from \(from)), no rewind; \(String(format: "%.3f", Date().timeIntervalSince(t0))) s")
         publish()
         scheduleCheck(state.trackName)
@@ -425,6 +503,7 @@ final class RateFollower: @unchecked Sendable {
         formatChangedAt = Date()
         gridLast = nil
         gridBad = 0
+        learnCleanFrames = 0
 
         // rewind to where the track began playing (measured to the pause; near the start = the start)
         let pos = scripts.position() ?? 0
@@ -559,7 +638,12 @@ final class RateFollower: @unchecked Sendable {
         guard let last = gridLast, st.runFrames > last.frames, st.runOffGridSamples >= last.offGrid else { return }
         let settled = max(lastNewTrackAt ?? .distantPast, lastSeekAt ?? .distantPast)
         guard Date().timeIntervalSince(settled) > 3, Date().timeIntervalSince(formatChangedAt) > 1 else { return }
-        let ratio = Double(st.runOffGridSamples - last.offGrid) / Double((st.runFrames - last.frames) * 2)
+        let fDelta = st.runFrames - last.frames
+        let oDelta = st.runOffGridSamples - last.offGrid
+        if oDelta == 0 { learnCleanFrames += fDelta }
+        // lossy (AAC) or Atmos content is never on the grid: don't chase it
+        if trackLossy || trackAtmos { return }
+        let ratio = Double(oDelta) / Double(fDelta * 2)
         if ratio < 0.3 {
             gridBad = 0
             return
@@ -585,6 +669,24 @@ final class RateFollower: @unchecked Sendable {
         state.trackRate = f.rate
         state.trackBits = f.bits
         upgrade(to: f, why: "corrected by the grid check")
+    }
+
+    // MARK: - rate library
+
+    /// Records the outgoing track's outcome (a track that played clean ≥ 10 s after its last format
+    /// change counts as confirmed; a lossy/Atmos one is remembered as lossy so nothing chases it).
+    private func finalizeLearning() {
+        guard let key = currentKey else { return }
+        currentKey = nil
+        let cleanSeconds = learnCleanFrames > 0 && curRate > 0 ? Double(learnCleanFrames) / curRate : 0
+        if trackLossy || trackAtmos {
+            RateLibrary.shared.learn(key, rate: trackTarget?.rate ?? curRate, bits: 24, lossy: true)
+            elog("rate library: \(state.trackName) learned as lossy")
+        } else if cleanSeconds >= 10 {
+            RateLibrary.shared.learn(key, rate: curRate, bits: curBits, lossy: false)
+            elog("rate library: \(state.trackName) learned \(Int(curRate)) Hz / \(curBits)-bit (\(Int(cleanSeconds)) s clean)")
+        }
+        learnCleanFrames = 0
     }
 
     /// Logs the driver's bit-perfect check for the current run a few seconds into a track.

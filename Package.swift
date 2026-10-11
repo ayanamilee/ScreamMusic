@@ -7,10 +7,20 @@ let package = Package(
     name: "ScreamMusic",
     platforms: [.macOS("26.0")],
     targets: [
+        .target(
+            name: "ScreamMusicKit",
+            path: "App/Sources/Kit"
+        ),
         .executableTarget(
             name: "ScreamMusic",
+            dependencies: ["ScreamMusicKit"],
             path: "App/Sources/ScreamMusic",
             swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "ScreamMusicKitTests",
+            dependencies: ["ScreamMusicKit"],
+            path: "Tests/RateLibrary"
         ),
     ]
 )

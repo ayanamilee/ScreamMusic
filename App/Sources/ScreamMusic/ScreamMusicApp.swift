@@ -169,8 +169,12 @@ struct PanelView: View {
             if music.enabled {
                 let f = music.follower
                 if !f.trackName.isEmpty {
-                    Text("\(f.trackName)\(f.trackRate.map { " — \(rateText($0))" } ?? "")\(f.trackBits.map { " / \($0)-bit" } ?? "")\(f.lossless ? "" : " (lossy)")")
+                    Text("\(f.trackName)\(f.trackRate.map { " — \(rateText($0))" } ?? "")\(f.trackBits.map { " / \($0)-bit" } ?? "")\(f.atmos ? " (Dolby Atmos)" : f.lossless ? "" : " (lossy)")")
                         .font(.callout).lineLimit(1)
+                    if !f.source.isEmpty {
+                        Text(f.source == "rate library" ? "Format from the rate library" : "Format from \(f.source)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 if !f.lastAction.isEmpty {
                     Text(f.lastAction + (f.switches > 0 ? "  ·  \(f.switches) switch\(f.switches == 1 ? "" : "es")" : ""))
@@ -234,6 +238,13 @@ struct PanelView: View {
                 .font(.caption).foregroundStyle(.secondary)
             Group {
                 Text("Device format: \(s.physicalFormat), \(rateText(model.rate ?? 0))")
+                HStack {
+                    Text("Rate library: \(music.follower.libraryCount) tracks")
+                    Spacer()
+                    if music.follower.libraryCount > 0 {
+                        Button("Clear") { music.clearRateLibrary() }
+                    }
+                }
                 Text("Packets \(s.packets)  ·  end-of-track \(s.endOfTrackMarkers)  ·  hold \(s.holdMode)\(s.holdReached ? " (holding)" : "")")
                 if s.othersFrames > 0 { Text("Other apps' frames moved: \(s.othersFrames)") }
                 Text("Log: ~/Library/Logs/ScreamMusic.log")

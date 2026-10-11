@@ -11,6 +11,7 @@
 import AppKit
 import CoreAudio
 import Foundation
+import ScreamMusicKit
 
 @MainActor
 final class MusicMode: ObservableObject {
@@ -194,6 +195,12 @@ final class MusicMode: ObservableObject {
         let pid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").first?.processIdentifier ?? 0
         ScreamDevice.setInt(dev, ScreamDevice.musicPID, Int(pid))
         elog("music mode: Music pid \(pid)")
+    }
+
+    func clearRateLibrary() {
+        RateLibrary.shared.removeAll()
+        follower.libraryCount = 0
+        elog("rate library: cleared")
     }
 
     private func restartFollower() {
