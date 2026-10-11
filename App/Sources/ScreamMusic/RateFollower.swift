@@ -91,6 +91,9 @@ final class RateFollower: @unchecked Sendable {
     /// The current track is lossy (AAC) or Atmos: the grid check stays out, the library learns lossy.
     private var trackLossy = false
     private var trackAtmos = false
+    /// An AAC decoder line was seen; the track is only called lossy if no lossless line of its own
+    /// shows within 10 s of its start (streams often open AAC and swap in ALAC a second later).
+    private var aacSeenAt: Date?
     /// Learning: frames of clean windows since the last format change / track start.
     private var learnCleanFrames = 0
 
@@ -243,6 +246,7 @@ final class RateFollower: @unchecked Sendable {
         gridTried = []
         trackLossy = false
         trackAtmos = false
+        aacSeenAt = nil
         learnCleanFrames = 0
         state.trackName = name
 
@@ -284,6 +288,7 @@ final class RateFollower: @unchecked Sendable {
                 self.decide(Fmt(rate: r, bits: r == self.curRate ? self.curBits : 24), name: aw.name, tPlay: aw.tPlay, how: "Music's rate, no decoder line", manualStart: true)
             } else {
                 elog("new track \(aw.name): format unknown after \(Self.startWait) s; playing on at \(Int(self.curRate)) Hz")
+                self.state.source = "unknown"
                 self.release("format unknown")
             }
         }
@@ -358,15 +363,28 @@ final class RateFollower: @unchecked Sendable {
             return
         }
         if aac {
-            // a lossy decoder: the samples are AAC reconstructions, never on the grid. A stream can
-            // start lossy and upgrade to ALAC a few seconds in; its line supersedes this one.
+            // a lossy decoder: the samples are AAC reconstructions, never on the grid. But a stream
+            // can open AAC and swap in ALAC a second later, so only call the track lossy when no
+            // lossless line of its own shows within 10 s of its start.
             if let aw = awaiting {
                 awaiting = nil
                 decide(Fmt(rate: rate, bits: 24), name: aw.name, tPlay: aw.tPlay, how: "its decoder line (AAC)", manualStart: true, lossy: true)
-            } else if playing, let started = lastNewTrackAt, at.timeIntervalSince(started) < Self.trackWindow {
-                trackLossy = true
-                state.lossless = false
-                publish()
+                return
+            }
+            if playing {
+                aacSeenAt = at
+                elog("decoder: \(Int(rate)) Hz AAC (waiting \(Int(Self.trackWindow)) s for a lossless line before calling it lossy)")
+                let id = lastTrackID
+                let deadline = (lastNewTrackAt ?? at).addingTimeInterval(Self.trackWindow + 0.2)
+                q.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSinceNow)) { [weak self] in
+                    guard let self, !self.stopped, self.playing, self.lastTrackID == id,
+                          self.aacSeenAt != nil, !self.trackLossy,
+                          self.trackFormats.isEmpty, self.maybeFormats.isEmpty else { return }
+                    self.trackLossy = true
+                    self.state.lossless = false
+                    self.publish()
+                    elog("decoder: \(self.state.trackName) is AAC (lossy)")
+                }
             }
             return
         }
@@ -378,8 +396,9 @@ final class RateFollower: @unchecked Sendable {
         // Only this track's own lines count: while awaiting its decoder, or inside its window.
         let sinceStart0 = lastNewTrackAt.map { at.timeIntervalSince($0) } ?? .infinity
         let ownWindow0 = awaiting != nil || (sinceStart0 < Self.trackWindow) || (ownLinesUntil.map { at <= $0 } ?? false)
-        if trackLossy && ownWindow0 {
+        if (trackLossy || aacSeenAt != nil) && ownWindow0 {
             trackLossy = false
+            aacSeenAt = nil
             if !trackAtmos { state.lossless = true }
             publish()
             elog("decoder: \(state.trackName) upgraded to lossless")
