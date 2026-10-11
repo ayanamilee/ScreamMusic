@@ -104,12 +104,16 @@ struct PanelView: View {
                 Text("Idle").fontWeight(.medium)
             }
             Group {
-                if s.running {
-                    if s.runFrames > 0 && s.runOffGridSamples == 0 {
-                        Text("Bit-perfect: every sample on the \(s.wireBits)-bit grid").foregroundStyle(.green)
-                    } else if s.runOffGridSamples > 0 {
-                        Text("Not bit-perfect: \(s.runOffGridSamples) samples off the \(s.wireBits)-bit grid (resampled, volume or EQ)").foregroundStyle(.orange)
-                    }
+                switch model.bitPerfect {
+                case .idle:
+                    EmptyView()
+                case .checking:
+                    Text("Checking bit-perfect…").foregroundStyle(.secondary)
+                case .perfect(let since):
+                    let seconds = Int(Date().timeIntervalSince(since))
+                    Text("Bit-perfect: on the \(s.wireBits)-bit grid, clean for \(seconds / 60):\(String(format: "%02d", seconds % 60))").foregroundStyle(.green)
+                case .degraded(let offGrid):
+                    Text("Not bit-perfect: \(offGrid) samples off the \(s.wireBits)-bit grid in the last second (resampled, volume or EQ)").foregroundStyle(.orange)
                 }
                 if let pid = model.hogOwner { Text("Exclusive (hog) by pid \(pid)") }
                 if !s.clients.isEmpty {
