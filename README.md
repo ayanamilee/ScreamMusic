@@ -26,7 +26,6 @@ Original 只发 32 位 PCM。Extended 按曲目发 16 / 24 / 32 位。
 1. 打开 App，点 **Install Driver…**（要管理员密码，系统声音会断一两秒）。
 2. 填接收端，点 Apply。
 3. **Apple Music**：打开 Apple Music mode。允许控制 Music；若要把其他 App 转到另一块声卡，再允许麦克风。
-4. **Audirvana、Roon 等**：不用开这个模式，在播放器里选 ScreamMusic。
 
 音量在功放或接收端调。这块声卡没有音量，否则就不是 bit-perfect。
 
