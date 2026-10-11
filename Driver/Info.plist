@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>ScreamMusic</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ayanamilee.ScreamMusic.driver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ScreamMusic</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.8</string>
+	<key>CFBundleVersion</key>
+	<string>7</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>A7FAAA72-D59F-4913-AB91-CF10D919CEF0</key>
+		<string>ScreamMusic_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>A7FAAA72-D59F-4913-AB91-CF10D919CEF0</string>
+		</array>
+	</dict>
+	<key>AudioServerPlugIn_Network</key>
+	<true/>
+</dict>
+</plist>
