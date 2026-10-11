@@ -95,6 +95,37 @@ final class AppModel: ObservableObject {
         poll()
     }
 
+    /// Removes everything: Apple Music mode off and outputs restored, the driver (one administrator
+    /// prompt), this app's preferences and logs, then the app itself (when it sits somewhere
+    /// user-deletable). `finish` runs on the main thread with whether the app should also delete
+    /// itself (false: the user has to move it to the Trash).
+    func uninstall(finish: @escaping (Bool) -> Void) {
+        musicMode.setEnabled(false)
+        installer.remove { ok in
+            guard ok else { return }   // cancelled or failed: the app stays
+            if let id = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: id)
+            }
+            let fm = FileManager.default
+            let logs = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
+            for name in ["ScreamMusic.log", "ScreamMusic.1.log", "ScreamMusic.2.log"] {
+                try? fm.removeItem(at: logs.appendingPathComponent(name))
+            }
+            let app = Bundle.main.bundleURL
+            if fm.isDeletableFile(atPath: app.path) {
+                let escaped = app.path.replacingOccurrences(of: "'", with: "'\\''")
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                // after the app has quit
+                p.arguments = ["-c", "sleep 1; rm -rf '\(escaped)'"]
+                try? p.run()
+                finish(true)
+            } else {
+                finish(false)
+            }
+        }
+    }
+
     private func updateBitPerfect() {
         let s = status
         guard s.running else {

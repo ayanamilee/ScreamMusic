@@ -53,6 +53,8 @@ struct PanelView: View {
     @ObservedObject var installer: DriverInstaller
     @ObservedObject var music: MusicMode
     @State private var advanced = false
+    @State private var confirmUninstall = false
+    @State private var uninstallNote: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -83,6 +85,27 @@ struct PanelView: View {
         }
         .padding(14)
         .frame(width: 380)
+        .alert("Uninstall ScreamMusic?", isPresented: $confirmUninstall) {
+            Button("Uninstall", role: .destructive) { uninstall() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Turns off Apple Music mode and restores the outputs, removes the driver (administrator password; audio restarts for a moment), deletes this app's settings and logs, then deletes and quits the app.")
+        }
+        .alert("ScreamMusic", isPresented: Binding(get: { uninstallNote != nil }, set: { if !$0 { uninstallNote = nil } })) {
+            Button("OK") { NSApplication.shared.terminate(nil) }
+        } message: {
+            Text(uninstallNote ?? "")
+        }
+    }
+
+    private func uninstall() {
+        model.uninstall { deleted in
+            if deleted {
+                NSApplication.shared.terminate(nil)
+            } else {
+                uninstallNote = "The driver, settings and logs are gone. The app is still at:\n\(Bundle.main.bundleURL.path)\n\nMove it to the Trash yourself."
+            }
+        }
     }
 
     private var driverMissing: some View {
@@ -229,6 +252,7 @@ struct PanelView: View {
                     Text("Driver \(v)").foregroundStyle(.secondary)
                     Spacer()
                     Button("Remove Driver…") { installer.remove() }
+                    Button("Uninstall…") { confirmUninstall = true }
                 case .outdated(let i, let b):
                     Text("Driver \(i) (this app carries \(b))").foregroundStyle(.secondary)
                     Spacer()

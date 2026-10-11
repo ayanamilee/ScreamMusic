@@ -56,12 +56,13 @@ final class DriverInstaller: ObservableObject {
             prompt: "ScreamMusic wants to install its audio driver. Audio restarts for a moment.")
     }
 
-    func remove() {
+    func remove(done: (@MainActor (Bool) -> Void)? = nil) {
         run("rm -rf \(q(Self.installPath)) && /usr/bin/killall coreaudiod",
-            prompt: "ScreamMusic wants to remove its audio driver. Audio restarts for a moment.")
+            prompt: "ScreamMusic wants to remove its audio driver. Audio restarts for a moment.",
+            done: done)
     }
 
-    private func run(_ shell: String, prompt: String) {
+    private func run(_ shell: String, prompt: String, done: (@MainActor (Bool) -> Void)? = nil) {
         busy = true
         lastError = nil
         let source = "do shell script \"\(Self.escape(shell))\" with administrator privileges with prompt \"\(Self.escape(prompt))\""
@@ -80,6 +81,7 @@ final class DriverInstaller: ObservableObject {
                 self.busy = false
                 if !ok, !cancelled { self.lastError = message }
                 self.refresh()
+                done?(ok)
             }
         }
     }
