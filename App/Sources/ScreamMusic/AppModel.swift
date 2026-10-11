@@ -36,10 +36,35 @@ final class AppModel: ObservableObject {
     private var lastRun: (frames: Int, offGrid: Int)?
     private var cleanWindows = 0
 
+    // MARK: - underrun badge
+
+    /// The driver's underrun counter only ever grows (~1 per ms of stall), so the panel shows the
+    /// recent stalls instead: each increment is about a millisecond of the sender waiting.
+    @Published private(set) var underrunMs = 0
+    private var lastUnderruns: Int?
+    private var underrunQuiet = 0
+
     private var isDegraded: Bool {
         if case .degraded = bitPerfect { return true }
         return false
     }
+
+    /// Every poll (1 s). A growing counter means the sender just waited for audio; show the recent
+    /// stalls and hide them again after a few quiet seconds.
+    private func updateUnderruns() {
+        let u = status.underruns
+        defer { lastUnderruns = u }
+        guard let last = lastUnderruns else { return }
+        let delta = u - last
+        if delta > 0 {
+            underrunMs += delta
+            underrunQuiet = 0
+        } else {
+            underrunQuiet += 1
+            if underrunQuiet >= 3 { underrunMs = 0 }
+        }
+    }
+
 
     let installer = DriverInstaller()
     let musicMode = MusicMode()
@@ -74,6 +99,7 @@ final class AppModel: ObservableObject {
         rate = ScreamDevice.nominalRate(d)
         hogOwner = ScreamDevice.hogOwner(d)
         updateBitPerfect()
+        updateUnderruns()
         if let dest = Destination(ScreamDevice.get(d, ScreamDevice.destination)), dest != destination {
             let editing = edit != destination
             destination = dest

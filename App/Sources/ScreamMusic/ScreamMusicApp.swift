@@ -143,8 +143,11 @@ struct PanelView: View {
                     Text("Playing: " + s.clients.map { $0.bundleID.isEmpty ? "pid \($0.pid)" : $0.bundleID }.joined(separator: ", "))
                         .lineLimit(2)
                 }
-                if s.underruns > 0 || s.overflowBytes > 0 {
-                    Text("Underruns \(s.underruns)  ·  overflow \(s.overflowBytes) bytes").foregroundStyle(.orange)
+                if model.underrunMs > 0 {
+                    Text("Sender stalled ~\(model.underrunMs) ms just now").foregroundStyle(.orange)
+                }
+                if s.overflowBytes > 0 {
+                    Text("Overflow: \(s.overflowBytes) bytes dropped").foregroundStyle(.orange)
                 }
                 if s.sendErrors > 0 {
                     Text("Send errors: \(s.sendErrors) (errno \(s.lastErrno))").foregroundStyle(.red)
