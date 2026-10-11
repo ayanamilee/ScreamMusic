@@ -373,6 +373,18 @@ final class RateFollower: @unchecked Sendable {
 
         let line = fmt(rate: rate, bits: bits)
 
+        // lossless after a lossy start (a stream swapping in its ALAC, or a track the library knows
+        // as lossy playing lossless now): stop treating it as lossy; the grid check works again.
+        // Only this track's own lines count: while awaiting its decoder, or inside its window.
+        let sinceStart0 = lastNewTrackAt.map { at.timeIntervalSince($0) } ?? .infinity
+        let ownWindow0 = awaiting != nil || (sinceStart0 < Self.trackWindow) || (ownLinesUntil.map { at <= $0 } ?? false)
+        if trackLossy && ownWindow0 {
+            trackLossy = false
+            if !trackAtmos { state.lossless = true }
+            publish()
+            elog("decoder: \(state.trackName) upgraded to lossless")
+        }
+
         if let aw = awaiting {
             guard let f = line else { return }      // a 'qlac' line without the depth: its partner follows
             awaiting = nil
