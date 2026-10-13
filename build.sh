@@ -17,6 +17,11 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/ScreamMusic" "$app/Contents/MacOS/ScreamMusic"
 cp "$root/App/Resources/Info.plist" "$app/Contents/Info.plist"
+[ -f "$root/App/Resources/AppIcon.icns" ] && \
+    cp "$root/App/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+for f in "$root/App/Resources"/MenuBarIcon*.png; do
+    [ -f "$f" ] && cp "$f" "$app/Contents/Resources/"
+done
 
 if [ -x "$root/Driver/build.sh" ]; then
     "$root/Driver/build.sh" "$root/build"

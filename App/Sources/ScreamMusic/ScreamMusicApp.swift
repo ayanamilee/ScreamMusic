@@ -54,11 +54,28 @@ struct ScreamMusicApp: App {
         .defaultLaunchBehavior(.presented)
         .windowResizability(.contentSize)
 
-        MenuBarExtra("ScreamMusic", systemImage: "hifispeaker") {
+        MenuBarExtra {
             PanelView(model: delegate.model, installer: delegate.model.installer, music: delegate.model.musicMode)
+        } label: {
+            // Template image: macOS recolors it for light/dark menu bars itself.
+            Image(nsImage: NSImage.menuBarIcon)
+                .accessibilityLabel("ScreamMusic")
         }
         .menuBarExtraStyle(.window)
     }
+}
+
+extension NSImage {
+    /// Menu-bar glyph (note + broadcast rays); falls back to an SF Symbol if resources are missing.
+    static let menuBarIcon: NSImage = {
+        if let img = NSImage(named: "MenuBarIcon") {
+            img.isTemplate = true
+            return img
+        }
+        let img = NSImage(systemSymbolName: "hifispeaker", accessibilityDescription: "ScreamMusic")!
+        img.isTemplate = true
+        return img
+    }()
 }
 
 enum AppVersion {
