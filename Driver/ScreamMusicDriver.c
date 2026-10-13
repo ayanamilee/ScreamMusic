@@ -58,11 +58,13 @@ enum {
     kSM_EndOfTrack  = 'SMeo',   /* CFNumber, write 1 */
     kSM_SendDelay   = 'SMdl',   /* CFNumber, milliseconds */
     kSM_WireBits    = 'SMbd',   /* CFNumber, Float32 input: 0 auto, 16/24/32 */
-    kSM_MusicPID    = 'SMmx',   /* CFNumber, Apple Music mode: only this pid is sent; 0 = off */
+    kSM_MusicPID    = 'SMmx',   /* CFNumber, Apple Music mode: only this pid is sent; 0 = no Music */
     kSM_Hold        = 'SMhd',   /* CFNumber, hold point: 0 run, 1 gate, 2 boundary, 3 drop */
     kSM_HoldReached = 'SMhr',   /* CFNumber, read only: 1 = holding */
     kSM_Owner       = 'SMac',   /* CFNumber, the controlling app's pid (cleanup when it dies) */
     kSM_Mirror      = 'SMmr',   /* CFDictionary {ip, port}: also send every packet there (diagnostics); {} = off */
+    kSM_LeadIn      = 'SMli',   /* CFNumber, milliseconds of silence before a new wire format (relock) */
+    kSM_LeadOnce    = 'SMlo',   /* CFNumber, ms of lead-in for the next format change only (0 = none); expires */
 };
 
 enum { kHold_Run = 0, kHold_Gate = 1, kHold_Boundary = 2, kHold_Drop = 3 };
@@ -78,6 +80,10 @@ typedef enum { kFmt_Float32 = 0, kFmt_SInt16, kFmt_SInt24, kFmt_SInt32, kNumForm
 #define kZeroTimeStampPeriod  16384u
 #define kDefaultDelayMs       20u
 #define kMaxDelayMs           1000u
+#define kDefaultLeadInMs      500u
+#define kMaxLeadInMs          2000u
+#define kLeadFillSec          1.5          /* after the lead-in, zeros until the run's first audio */
+#define kLeadOnceSec          3            /* SMlo: how long it waits for the format change it was set for */
 #define kRingBytes            (1u << 22)   /* 4 MiB: > 1 s at 384 kHz S32 stereo */
 #define kMaxClients           64
 #define kClientSlots          256          /* client ID -> pid, read on the IO thread */
@@ -165,6 +171,9 @@ static char gMirrorIP[64];                 /* "" = no mirror; guarded by gDestMu
 static unsigned gMirrorPort;
 
 static _Atomic unsigned gDelayMs = kDefaultDelayMs;
+static _Atomic unsigned gLeadInMs = kDefaultLeadInMs;
+static _Atomic int gLeadOnceMs = -1;             /* SMlo; -1 = not set */
+static _Atomic uint64_t gLeadOnceUntil;          /* host time after which it no longer applies */
 static _Atomic unsigned gWantBits;         /* SMbd: 0 = auto */
 static _Atomic int gMusicPID;              /* SMmx */
 static _Atomic int gOwnerPID;              /* SMac */
@@ -398,6 +407,10 @@ static void save_settings(void)
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &ms);
     gHost->WriteToStorage(gHost, CFSTR("delay_ms"), n);
     CFRelease(n);
+    ms = (int)atomic_load(&gLeadInMs);
+    n = CFNumberCreate(NULL, kCFNumberIntType, &ms);
+    gHost->WriteToStorage(gHost, CFSTR("lead_in_ms"), n);
+    CFRelease(n);
 }
 
 static void load_settings(void)
@@ -413,6 +426,13 @@ static void load_settings(void)
         int ms;
         if (CFGetTypeID(p) == CFNumberGetTypeID() && CFNumberGetValue(p, kCFNumberIntType, &ms) && ms >= 0 && ms <= (int)kMaxDelayMs)
             atomic_store(&gDelayMs, (unsigned)ms);
+        CFRelease(p);
+    }
+    p = NULL;
+    if (gHost->CopyFromStorage(gHost, CFSTR("lead_in_ms"), &p) == 0 && p) {
+        int ms;
+        if (CFGetTypeID(p) == CFNumberGetTypeID() && CFNumberGetValue(p, kCFNumberIntType, &ms) && ms >= 0 && ms <= (int)kMaxLeadInMs)
+            atomic_store(&gLeadInMs, (unsigned)ms);
         CFRelease(p);
     }
 }
@@ -475,6 +495,7 @@ static CFDictionaryRef copy_status(void)
     dict_set_u64(d, CFSTR("othersFrames"), atomic_load(&gStatOthersFrames));
     dict_set_u64(d, CFSTR("endOfTrackMarkers"), atomic_load(&gStatEOTs));
     dict_set_u64(d, CFSTR("delayMs"), atomic_load(&gDelayMs));
+    dict_set_u64(d, CFSTR("leadInMs"), atomic_load(&gLeadInMs));
     dict_set_u64(d, CFSTR("musicPID"), (uint64_t)atomic_load(&gMusicPID));
     dict_set_u64(d, CFSTR("ownerPID"), (uint64_t)atomic_load(&gOwnerPID));
     dict_set_u64(d, CFSTR("holdMode"), (uint64_t)atomic_load(&gHoldMode));
@@ -757,6 +778,7 @@ static void *sender_main(void *arg)
     unsigned myGen = 0;
     bool streamed = false;      /* sent audio since the last end-of-track marker */
     stream_t st = gStream;
+    stream_t lastSent = {0};    /* the wire format the receiver last got a whole lead-in or audio in */
     uint64_t ownerCheck = 0;
 
     for (;;) {
@@ -797,6 +819,23 @@ static void *sender_main(void *arg)
         pace_t p = pace_for(&st);
         if (!p.bytesPerSec) continue;
         unsigned fb = scream_frame_bytes(st.wire);
+
+        /* relock lead-in (SMli): a new wire format starts with digital silence, so the receiver's
+         * DAC locks to it before the first sound; then zeros while the run's audio is not ready
+         * (a switch's rewind and prefill), at most kLeadFillSec more, so the stream has no gap */
+        unsigned leadMs = atomic_load(&gLeadInMs);
+        bool changed = !same_wire(&lastSent, &st);
+        int once = atomic_load(&gLeadOnceMs);
+        if (changed && once >= 0) {      /* SMlo: for this format change only (a stream's live upgrade) */
+            if (mach_absolute_time() < atomic_load(&gLeadOnceUntil)) leadMs = (unsigned)once;
+            atomic_store(&gLeadOnceMs, -1);
+        }
+        bool leading = leadMs && changed;
+        if (!leading) lastSent = st;     /* no lead-in owed: the receiver counts as synced to this format */
+        uint64_t leadLeft = leading ? ((uint64_t)leadMs * p.bytesPerSec / 1000u + SCREAM_PAYLOAD_SIZE - 1)
+                                          / SCREAM_PAYLOAD_SIZE * SCREAM_PAYLOAD_SIZE : 0;
+        uint64_t leadNext = mach_absolute_time();
+        uint64_t leadUntil = leadNext + (uint64_t)(((double)leadMs / 1000.0 + kLeadFillSec) * gHostTicksPerSecond);
         uint32_t thr = st.rate / 100;     /* 10 ms of silence marks a track boundary */
 
         /* prefill: the send delay (SMdl), at least one payload */
@@ -824,6 +863,24 @@ static void *sender_main(void *arg)
             }
             bool running = atomic_load(&gRunning);
             uint64_t now = mach_absolute_time();
+
+            if (leading) {
+                if (sentInRun || !running || (!leadLeft && now > leadUntil)) {
+                    leading = false;
+                    leadLeft = 0;
+                } else {
+                    while (now >= leadNext &&
+                           (leadLeft || (needPrefill && ring_fill() < prefill && now <= leadUntil))) {
+                        memset(payload, 0, sizeof payload);
+                        send_payload(&s, &st, payload);
+                        /* not `streamed` and not lastSent: a lead-in cut short (the run restarts while
+                         * the device switches) must neither end with a marker nor count as done */
+                        leadLeft = leadLeft > SCREAM_PAYLOAD_SIZE ? leadLeft - SCREAM_PAYLOAD_SIZE : 0;
+                        if (!leadLeft) lastSent = st;
+                        leadNext += p.periodTicks;
+                    }
+                }
+            }
 
             /* hold point requests */
             int mode = atomic_load(&gHoldMode);
@@ -868,6 +925,10 @@ static void *sender_main(void *arg)
                 continue;
             }
 
+            if (leadLeft) {          /* the lead-in first: the audio waits in the ring */
+                usleep(500);
+                continue;
+            }
             uint64_t fill = ring_fill();
             if (needPrefill) {
                 if (running && fill < prefill) {
@@ -898,6 +959,7 @@ static void *sender_main(void *arg)
                             ring_take(payload, holdAt);
                             send_payload(&s, &st, payload);
                             streamed = true;
+                            lastSent = st;
                         }
                         held = true;
                         heldSince = now;
@@ -910,6 +972,7 @@ static void *sender_main(void *arg)
                 ring_take(payload, SCREAM_PAYLOAD_SIZE);
                 send_payload(&s, &st, payload);
                 streamed = true;
+                lastSent = st;
                 lastAudio = now;
                 silent = silent_after(payload, SCREAM_PAYLOAD_SIZE, fb, silent);
                 sentInRun = true;
@@ -1225,7 +1288,7 @@ static OSStatus plugin_get(const AudioObjectPropertyAddress *a, UInt32 qSize, co
 static const AudioServerPlugInCustomPropertyInfo kCustomProps[] = {
     CUSTOM(kSM_Destination), CUSTOM(kSM_Status), CUSTOM(kSM_EndOfTrack), CUSTOM(kSM_SendDelay),
     CUSTOM(kSM_WireBits), CUSTOM(kSM_MusicPID), CUSTOM(kSM_Hold), CUSTOM(kSM_HoldReached), CUSTOM(kSM_Owner),
-    CUSTOM(kSM_Mirror),
+    CUSTOM(kSM_Mirror), CUSTOM(kSM_LeadIn), CUSTOM(kSM_LeadOnce),
 };
 #define kNumCustomProps (sizeof kCustomProps / sizeof kCustomProps[0])
 
@@ -1285,6 +1348,8 @@ static OSStatus device_settable(const AudioObjectPropertyAddress *a, Boolean *ou
     case kSM_Destination:
     case kSM_EndOfTrack:
     case kSM_SendDelay:
+    case kSM_LeadIn:
+    case kSM_LeadOnce:
     case kSM_WireBits:
     case kSM_MusicPID:
     case kSM_Hold:
@@ -1414,6 +1479,8 @@ static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
     case kSM_Status:      WRITE_VALUE(CFPropertyListRef, copy_status()); return 0;
     case kSM_EndOfTrack:  WRITE_VALUE(CFPropertyListRef, number_i(0)); return 0;
     case kSM_SendDelay:   WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gDelayMs))); return 0;
+    case kSM_LeadIn:      WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gLeadInMs))); return 0;
+    case kSM_LeadOnce:    WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gLeadOnceMs))); return 0;
     case kSM_WireBits:    WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gWantBits))); return 0;
     case kSM_MusicPID:    WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gMusicPID))); return 0;
     case kSM_Hold:        WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gHoldMode))); return 0;
@@ -1503,6 +1570,16 @@ static OSStatus device_set(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
         if (gHost) gHost->PropertiesChanged(gHost, kObjectID_Device, 1, &lat);
         return 0;
     }
+    case kSM_LeadIn:
+        if (v < 0 || v > (int)kMaxLeadInMs) return kAudioHardwareIllegalOperationError;
+        atomic_store(&gLeadInMs, (unsigned)v);
+        save_settings();
+        return 0;
+    case kSM_LeadOnce:      /* not persisted: it belongs to the format change that follows */
+        if (v < -1 || v > (int)kMaxLeadInMs) return kAudioHardwareIllegalOperationError;
+        atomic_store(&gLeadOnceUntil, mach_absolute_time() + (uint64_t)(kLeadOnceSec * gHostTicksPerSecond));
+        atomic_store(&gLeadOnceMs, v);
+        return 0;
     case kSM_WireBits: {
         if (v != 0 && v != 16 && v != 24 && v != 32) return kAudioHardwareIllegalOperationError;
         bool changed = atomic_exchange(&gWantBits, (unsigned)v) != (unsigned)v;
@@ -1514,7 +1591,7 @@ static OSStatus device_set(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
     }
     case kSM_MusicPID:
         atomic_store(&gMusicPID, v);
-        os_log(gLog, "ScreamMusic: Apple Music mode %{public}s (pid %d)", v ? "on" : "off", v);
+        os_log(gLog, "ScreamMusic: Music pid %d", v);
         return 0;
     case kSM_Hold:
         if (v < kHold_Run || v > kHold_Drop) return kAudioHardwareIllegalOperationError;
@@ -1863,12 +1940,21 @@ static void write_mix(const void *buffer, UInt32 frames)
  * Frames past everything written so far replace an old lap; the rest add (Nativerate's 1.1.5
  * rule: clients of one cycle need not share a sample time).
  */
+/* On while the controlling app owns the device, or a Music pid is set (the harness sets only the
+ * pid). Pid 0 means Music is not running, not that the mode is off. */
+static bool music_mode_on(void)
+{
+    return atomic_load_explicit(&gMusicPID, memory_order_relaxed) != 0
+        || atomic_load_explicit(&gOwnerPID, memory_order_relaxed) != 0;
+}
+
 static void process_output(UInt32 client, Float32 *buf, UInt32 frames, Float64 sampleTime)
 {
     atomic_store_explicit(&gClientLastOutput[client % kClientSlots], mach_absolute_time(), memory_order_relaxed);
+    if (sampleTime < 0.0 || gStream.format != kFmt_Float32 || !music_mode_on()) return;
     pid_t music = atomic_load_explicit(&gMusicPID, memory_order_relaxed);
-    if (!music || sampleTime < 0.0 || gStream.format != kFmt_Float32) return;
-    if (client_pid(client) == music) {
+    /* pid 0 is also what client_pid returns for an unknown client: never treat that as Music */
+    if (music && client_pid(client) == music) {
         int64_t end = (int64_t)sampleTime + frames;
         int64_t cur = atomic_load_explicit(&gMusicCoveredUntil, memory_order_relaxed);
         if (end > cur || cur - end > (int64_t)kOthersFrames) /* later, or the time line went back */
@@ -1892,7 +1978,7 @@ static void process_output(UInt32 client, Float32 *buf, UInt32 frames, Float64 s
 /* The others loopback, read back on the input stream and cleared as it is read. */
 static void read_input(Float32 *buf, UInt32 frames, Float64 sampleTime)
 {
-    if (sampleTime < 0.0 || !atomic_load_explicit(&gMusicPID, memory_order_relaxed)) {
+    if (sampleTime < 0.0 || !music_mode_on()) {
         memset(buf, 0, (size_t)frames * kChannels * sizeof(Float32));
         return;
     }
@@ -1921,7 +2007,7 @@ static OSStatus SM_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjec
          * the others loopback, and for other apps, whose output is moved there) */
         atomic_store_explicit(&gDiagMixSample, (int64_t)cycle->mOutputTime.mSampleTime, memory_order_relaxed);
         atomic_store_explicit(&gDiagMixFrames, frames, memory_order_relaxed);
-        if (atomic_load_explicit(&gMusicPID, memory_order_relaxed) && gStream.format == kFmt_Float32) {
+        if (music_mode_on() && gStream.format == kFmt_Float32) {
             int64_t covered = atomic_load_explicit(&gMusicCoveredUntil, memory_order_relaxed);
             int64_t t = (int64_t)cycle->mOutputTime.mSampleTime;
             /* not covered by Music: it isn't playing (allow one cycle of slack for ordering) */

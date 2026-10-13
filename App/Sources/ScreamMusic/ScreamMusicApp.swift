@@ -13,8 +13,30 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Bartender (and a full menu bar) hide the status item. The window is the way in, and an
+        // LSUIElement app will not show it unless asked. Also: don't wait on CoreAudio first — a
+        // driver reload leaves coreaudiod busy, and a blocked launch looks like the app did not open.
+        orderMainForward()
+        DispatchQueue.main.async { self.orderMainForward() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        orderMainForward()
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         model.musicMode.quit()
+    }
+
+    /// The status-item panel is a higher window level; only the normal "ScreamMusic" window.
+    private func orderMainForward() {
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where window.level == .normal {
+            window.collectionBehavior.insert(.moveToActiveSpace)
+            window.orderFrontRegardless()
+        }
     }
 }
 
@@ -29,6 +51,7 @@ struct ScreamMusicApp: App {
             PanelView(model: delegate.model, installer: delegate.model.installer, music: delegate.model.musicMode)
                 .onAppear { NSApp.activate() }   // an LSUIElement app isn't brought forward by itself
         }
+        .defaultLaunchBehavior(.presented)
         .windowResizability(.contentSize)
 
         MenuBarExtra("ScreamMusic", systemImage: "hifispeaker") {
@@ -236,6 +259,14 @@ struct PanelView: View {
             .disabled(music.enabled)
             Text(music.enabled ? "Apple Music mode sets the rate for each track." : "Players in exclusive mode set the rate themselves; this is for testing.")
                 .font(.caption).foregroundStyle(.secondary)
+            if let lead = s.leadInMs {
+                Picker("Silence before a new format", selection: Binding(get: { lead }, set: { model.setLeadIn($0) })) {
+                    ForEach(Array(Set([0, 250, 500, 1000, lead])).sorted(), id: \.self) { Text($0 == 0 ? "Off" : "\($0) ms").tag($0) }
+                }
+                Text("Gives the receiver's DAC time to lock to a new sample rate before the music starts (a click at a track's start).")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Group {
                 Text("Device format: \(s.physicalFormat), \(rateText(model.rate ?? 0))")
                 HStack {

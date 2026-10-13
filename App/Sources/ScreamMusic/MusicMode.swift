@@ -190,15 +190,21 @@ final class MusicMode: ObservableObject {
         d.set(false, forKey: Keys.ownsOutput)
     }
 
+    /// A pid no audio client has. Drivers through 0.4.2 treat 0 as "send every client", so quitting
+    /// Music used to stop diverting other apps (and send them at the receiver, which may be down).
+    private static let musicAbsentPID = -1
+
     private func updateMusicPID() {
         guard let dev = device else { return }
-        let pid = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").first?.processIdentifier ?? 0
-        ScreamDevice.setInt(dev, ScreamDevice.musicPID, Int(pid))
-        elog("music mode: Music pid \(pid)")
+        let music = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").first?.processIdentifier ?? 0
+        let pid = music == 0 ? Self.musicAbsentPID : Int(music)
+        ScreamDevice.setInt(dev, ScreamDevice.musicPID, pid)
+        elog("music mode: Music \(music == 0 ? "not running; other apps still diverted" : "pid \(music)")")
     }
 
     func clearRateLibrary() {
         RateLibrary.shared.removeAll()
+        rateFollower?.refreshLibraryCount()
         follower.libraryCount = 0
         elog("rate library: cleared")
     }

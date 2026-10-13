@@ -93,6 +93,7 @@ macos/ScreamMusic/
 - **定速**：每包间隔 = 1152 / (rate × 帧字节数)，用 `mach_wait_until` 绝对时间推进；落后则立即追，超前则等待（同 snd-screamalsa 的 `scream_playback_thread`）。避免一个 IO 周期内的几包成串突发。
 - 格式（采样率/位深）变化：先用旧格式发一个结束标记，再用新包头发新数据。
 - **结束标记**（`byte[4] |= 0x80`，UDP 仅发包头）：在 StopIO、格式变化、App 明确通知"播放结束"（`'SMeo'`）时发送；暂停不发。与 snd-screamalsa / amscream 语义一致。
+- **重锁前导**（0.4.5，`'SMli'`）：线上格式与接收端上次收到的不同（采样率、位深或包头方言）时，新 run 先按新格式节拍发至少 N ms 全零，再放音频；音频还没准备好（切换中的回退与预填）时继续发零，最多再 1.5 s，使数据流没有空档。接收端（s2d、apscream 等）→ DAC 在静音里完成重锁，第一个音符不会落在重锁期间。实测动机：自然衔接切换完全干净时，换采样率的曲目开头仍有一声轻微咔嗒，不换采样率重播则没有。Apple Music 模式的切换本身有约 1 s 空档，前导落在其中，不增加延迟；不回退的 live 切换（流媒体起播段升级）由 App 用 `'SMlo'` 关掉本次前导。前导只有发满才算数：被中途打断（设备停了又起）的下一个 run 会补发，期间不发结束标记。同格式重启不加。
 - 静音：IO 运行期间播放器送来的静音照常发送；"连续静音 N 秒后停止发包"作为后续可选项（便于 s2d 的上游静默释放）。
 
 ### 4.4 自定义属性（设备对象）
@@ -100,12 +101,14 @@ macos/ScreamMusic/
 | 选择器 | 类型 | 读/写 | 说明 |
 |---|---|---|---|
 | `'SMds'` | CFDictionary `{ip, port, header}` | 读写 | 目的地址与包头方言（`extended` / `original`）。驱动用 HAL host 的 `WriteToStorage` 持久化，App 不运行时也生效 |
-| `'SMmx'` | CFNumber pid | 读写 | Apple Music 模式：只把该 pid 的输出送去发送；其他进程的输出转入回送环（输入流）。0 = 关闭（所有客户端都发送） |
+| `'SMmx'` | CFNumber pid | 读写 | Music 的 pid。只把该 pid 的输出送去发送；其他进程转入回送环。0 = 没有 Music 进程（不是关闭模式）。`'SMac'` 非 0 时过滤仍开着，全部转入回送环、不发送。两者都为 0 才是通用模式 |
 | `'SMbd'` | CFNumber | 读写 | Float32 输入时的线上位深：0 = 自动（网格检测），16/24/32 = 指定 |
 | `'SMeo'` | CFNumber | 写 | 写 1 = 立即发送结束标记 |
 | `'SMdl'` | CFNumber 毫秒 | 读写 | 发送延迟（§6.2.3），同时作为设备延迟上报 |
 | `'SMhd'` | CFNumber | 读写 | 保持点：0 放行 / 1 闸门 / 2 曲目边界 / 3 丢弃（§6.2.3）。闸门/边界保持超过 4 s、丢弃超过 10 s 未被处理时驱动自动放行 |
 | `'SMhr'` | CFNumber | 读 | 1 = 已到达保持点、正在保持 |
+| `'SMli'` | CFNumber 毫秒 | 读写 | 换线上格式后先发的数字静音（0–2000，默认 500，0 = 关）。驱动持久化 |
+| `'SMlo'` | CFNumber 毫秒 | 写 | 只对**紧接着的那一次**格式切换用这个前导长度（-1 = 取消），3 s 内没有切换就作废，不持久化。App 在流媒体中途升级（48k 起播段→96k，没有回退可以遮住前导）时写 0，免得在 Music 本来就有的约 110 ms 空档上再加 0.5 s 静音 |
 | `'SMac'` | CFNumber pid | 读写 | 控制方 App 的 pid：它自己的 IO（读回送输入）不触发 Scream 发送；它退出后驱动自动清除 `'SMmx'`、`'SMhd'`、`'SMdl'` |
 | `'SMst'` | CFDictionary | 读 | 状态快照：客户端列表（pid、进程名、是否 hog）、物理格式、线上格式、网格检测结果、离网格计数、已发包数、发送错误、最后错误信息 |
 
@@ -149,7 +152,7 @@ original 方言下，16/24 位源以 S32_LE 发送（左移到高位，数值无
 
 1. 记录当前系统默认输出设备（作为"启动前的输出"）与系统提示音设备。
 2. 把系统默认输出设为 ScreamMusic；提示音移到"其他 App 输出到"的设备。
-3. 设置 `'SMmx'` = Music 的 pid（Music 重启时更新），`'SMdl'` = 发送延迟（默认 400 ms）。
+3. 设置 `'SMac'` = App 的 pid，`'SMmx'` = Music 的 pid（Music 未运行时为 0；0.4.2 及更早的驱动把 0 当成关闭过滤，App 在那种驱动上改写一个不会撞上的 pid），`'SMdl'` = 发送延迟（默认 400 ms）。
 4. 检查并提示破坏 bit-perfect 的 Music 设置：音量 < 100、Sound Check、EQ、AutoMix/交叉淡入淡出。
 
 关闭（或 App 退出）时：恢复默认输出与提示音设备，清除 `'SMmx'`、`'SMhd'`，`'SMdl'` 恢复通用值。App 异常退出后的下次启动要能恢复（参考 Nativerate `recoverOutput()`）。
@@ -183,7 +186,7 @@ Music 总是按设备当前标称采样率渲染，自己不切。App 得知"新
 
 与 LosslessSwitcher（只看日志、曲目开始后才切真实 DAC，开头错误采样率 + 断音）和 Nativerate（以 AppleScript 为准，仅在"有损起播 → 无损"时从当前位置再切一次；AppleScript 报低规格时不会纠正）相比，这套规则针对的正是起播段问题。
 
-**Rate Library（0.4.0，借鉴 Lysoniq Switcher）**：播过的曲目持久记住实测格式（`~/Library/Application Support/ScreamMusic/RateLibrary.json`）。键为 AppleScript 的 persistent ID（流媒体没有时用规范化"艺人 — 专辑 — 曲名"）。学习规则：曲目在当前格式下连续干净 ≥ 10 s → 记住；网格检查纠正过 → 记纠正后的格式；有损（AAC）/ Atmos → 记 lossy，以后不再追逐。使用规则：手动开始命中库 → 不再等解码器日志直接切；自然衔接时库优先于预读日志；库无条目时同专辑其他曲目的最常见格式作为网格候选。参考 Lysoniq Switcher 的 Rate Library；其 Relock Time/Pause Point（等 DAC 物理重锁）与 RP/KF 播放项日志关联（私有日志）不采用。AAC（`ACMP4AACBaseDecoder`）与 Atmos（`ACDDPAtmosDecoder`）日志单独识别：有损/渲染内容永远不在网格上，网格检查不动作，面板标注。
+**Rate Library（0.4.0，0.4.2 修订；借鉴 Lysoniq Switcher）**：播过的曲目持久记住实测格式（`~/Library/Application Support/ScreamMusic/RateLibrary.json`）。键为 AppleScript 的 persistent ID（流媒体没有时用规范化"艺人 — 专辑 — 曲名"；只有曲名时不记，避免和电台/流媒体互相冲突）。**库只是提示，不是权威**：学习只认"当前格式下连续干净 ≥ 10 s"；有损（AAC）/ Atmos 不记（0.4.0/0.4.1 记 lossy，结果标记自我维持，已取消，旧文件里的 lossy 条目加载时丢弃）。使用规则（`chooseStart`）：自然衔接时本曲预读行优先，库格式只作网格检查候选；手动开始没有预读行，命中库直接切，省掉等解码器日志的时间；库格式没守住（网格检查纠正或放弃）→ 删除该条目，下次按新证据决定，曲目干净结束后重新学习。库有锁，落盘走后台串行队列。AAC（`ACMP4AACBaseDecoder`）与 Atmos（`ACDDPAtmosDecoder`）日志单独识别：有损/渲染内容永远不在网格上，网格检查不动作，面板标注；AAC 起播后 10 s 内没有本曲无损行才认定有损（流媒体常先 AAC 后升级 ALAC）。参考 Lysoniq Switcher 的 Rate Library；其 Pause Point 与 RP/KF 播放项日志关联（私有日志）不采用；Relock Time 的思路 0.4.5 起由驱动的 `'SMli'` 实现（见 §4.3）。
 
 #### 6.2.3 截住与丢弃（驱动）
 
@@ -216,7 +219,7 @@ s2d 在收到新格式时重建 Diretta 连接（默认 200 ms 冷却），恰�
 
 ### 6.3 其他 App 的声音
 
-Apple Music 模式下 ScreamMusic 是系统默认输出，其他 App 的声音也会进来。驱动在 ProcessOutput 中把非 Music 客户端的数据移入回送环，从设备输入流读出；App 读取后播放到"其他 App 输出到"的设备（会经过重采样，不追求 bit-perfect）。选"静音丢弃"时 App 不读输入流，无需麦克风权限。
+Apple Music 模式下 ScreamMusic 是系统默认输出，其他 App 的声音也会进来，Music 没在跑时也一样。驱动在 ProcessOutput 中把非 Music 客户端的数据移入回送环，从设备输入流读出；App 读取后播放到"其他 App 输出到"的设备（会经过重采样，不追求 bit-perfect）。选"静音丢弃"时 App 不读输入流，无需麦克风权限。模式开着时这些声音不走 Scream，接收端没开会不会把它们吃掉。
 
 ### 6.4 通用模式（其他播放器）
 

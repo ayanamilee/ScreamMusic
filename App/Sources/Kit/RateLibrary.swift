@@ -3,25 +3,29 @@
 //  ScreamMusic
 //
 //  Remembers the format each track actually played at (the idea from Lysoniq Switcher's Rate
-//  Library): a track that has played once gets its device set before the music starts next time,
-//  instead of holding at the gate for its decoder log. Correction via the grid check updates the
-//  entry; a track that stayed off-grid with no candidates is remembered as lossy so nothing chases
-//  it again.
+//  Library): a track that has played once can have its device set at the gate on a manual start,
+//  instead of holding for its decoder line. It is only ever a hint: a track's own pre-roll line,
+//  decoder line and the grid check outrank it, and an entry the grid check had to correct is dropped
+//  and learned again.
 //
 //  Keys: the track's persistent ID when Music has one (local and library tracks), else the
-//  normalised "artist — album — name". Album-level hints use the "artist — album" prefix.
+//  normalised "artist — album — name" (see key(name:artist:album:)).
+//
+//  Thread-safe: the follower's queue reads and writes, the UI clears. Saving is asynchronous.
 //
 
 import Foundation
 
-public struct LearnedFormat: Codable, Equatable {
+public struct LearnedFormat: Codable, Equatable, Sendable {
     public var rate: Double
     public var bits: Int
+    /// Only read from files written by 0.4.0/0.4.1, which also remembered lossy tracks; those
+    /// entries are dropped on load (a lossy mark kept itself alive across plays).
     public var lossy: Bool
     public var confirmedAt: Date
     public var plays: Int
 
-    public init(rate: Double, bits: Int, lossy: Bool, confirmedAt: Date, plays: Int) {
+    public init(rate: Double, bits: Int, lossy: Bool = false, confirmedAt: Date, plays: Int) {
         self.rate = rate
         self.bits = bits
         self.lossy = lossy
@@ -30,16 +34,15 @@ public struct LearnedFormat: Codable, Equatable {
     }
 }
 
-/// Not thread-safe on its own; the app uses it only from the follower's serial queue.
 public final class RateLibrary: @unchecked Sendable {
 
     public static let maxEntries = 5000
 
+    private let lock = NSLock()
     private var entries: [String: LearnedFormat] = [:]
+    private var errorHandler: (String) -> Void = { _ in }
     private let url: URL
-
-    /// Save failures land here (the app wires it to its log). Default: silent.
-    public var onError: (String) -> Void = { _ in }
+    private let saveQueue = DispatchQueue(label: "ScreamMusic.RateLibrary.save", qos: .utility)
 
     /// The shared instance stores to ~/Library/Application Support/ScreamMusic/RateLibrary.json.
     public static let shared = RateLibrary()
@@ -55,7 +58,16 @@ public final class RateLibrary: @unchecked Sendable {
         load()
     }
 
-    public var count: Int { entries.count }
+    /// Save failures land here (the app wires it to its log). Default: silent.
+    public func setErrorHandler(_ handler: @escaping (String) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        errorHandler = handler
+    }
+
+    public var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entries.count
+    }
 
     // MARK: - keys
 
@@ -70,47 +82,50 @@ public final class RateLibrary: @unchecked Sendable {
         return parts.joined(separator: " — ")
     }
 
-    public static func albumKey(artist: String, album: String) -> String { key(name: "", artist: artist, album: album) }
+    // MARK: - lookup / learn / forget
 
-    // MARK: - lookup
-
-    public func lookup(_ trackKey: String) -> LearnedFormat? { entries[trackKey] }
-
-    /// The most common format among this album's other tracks, if any. A hint only: the grid check
-    /// still verifies.
-    public func albumHint(_ album: String) -> LearnedFormat? {
-        guard !album.isEmpty else { return nil }
-        var counts: [LearnedFormatKey: (format: LearnedFormat, count: Int)] = [:]
-        for (key, value) in entries where key.hasPrefix(album + " — ") && !value.lossy {
-            let k = LearnedFormatKey(rate: value.rate, bits: value.bits)
-            let c = counts[k] ?? (value, 0)
-            counts[k] = (c.format, c.count + 1)
-        }
-        return counts.values.max(by: { $0.count < $1.count })?.format
+    public func lookup(_ trackKey: String) -> LearnedFormat? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[trackKey]
     }
-
-    private struct LearnedFormatKey: Hashable { let rate: Double; let bits: Int }
-
-    // MARK: - learn
 
     /// Records the outcome of a play. Returns the entry now stored.
     @discardableResult
-    public func learn(_ trackKey: String, rate: Double, bits: Int, lossy: Bool) -> LearnedFormat {
-        var f = entries[trackKey] ?? LearnedFormat(rate: rate, bits: bits, lossy: lossy, confirmedAt: .distantPast, plays: 0)
+    public func learn(_ trackKey: String, rate: Double, bits: Int) -> LearnedFormat {
+        lock.lock()
+        var f = entries[trackKey] ?? LearnedFormat(rate: rate, bits: bits, confirmedAt: .distantPast, plays: 0)
         f.rate = rate
         f.bits = bits
-        f.lossy = lossy
+        f.lossy = false
         f.confirmedAt = Date()
         f.plays += 1
         entries[trackKey] = f
         trim()
-        save()
+        let snapshot = entries
+        lock.unlock()
+        save(snapshot)
         return f
     }
 
+    /// Drops one entry (the grid check showed it was wrong).
+    public func remove(_ trackKey: String) {
+        lock.lock()
+        let had = entries.removeValue(forKey: trackKey) != nil
+        let snapshot = entries
+        lock.unlock()
+        if had { save(snapshot) }
+    }
+
     public func removeAll() {
+        lock.lock()
         entries.removeAll()
-        save()
+        lock.unlock()
+        save([:])
+    }
+
+    /// Blocks until pending saves have reached the disk (quit, tests).
+    public func flush() {
+        saveQueue.sync {}
     }
 
     // MARK: - persistence
@@ -119,21 +134,28 @@ public final class RateLibrary: @unchecked Sendable {
         guard let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode([String: LearnedFormat].self, from: data)
         else { return }
-        entries = decoded
+        lock.lock(); defer { lock.unlock() }
+        entries = decoded.filter { !$0.value.lossy }
     }
 
-    private func save() {
-        do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(entries)
-            let tmp = url.appendingPathExtension("tmp")
-            try data.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } catch {
-            onError("rate library: could not save: \(error.localizedDescription)")
+    private func save(_ snapshot: [String: LearnedFormat]) {
+        saveQueue.async { [self] in
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(snapshot)
+                let tmp = url.appendingPathExtension("tmp")
+                try data.write(to: tmp, options: .atomic)
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } catch {
+                lock.lock()
+                let report = errorHandler
+                lock.unlock()
+                report("rate library: could not save: \(error.localizedDescription)")
+            }
         }
     }
 
+    /// Caller holds the lock.
     private func trim() {
         guard entries.count > Self.maxEntries else { return }
         let oldestFirst = entries.sorted { $0.value.confirmedAt < $1.value.confirmedAt }
