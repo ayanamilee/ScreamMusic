@@ -12,6 +12,10 @@
 	<string>ScreamMusic</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.4.7</string>
 	<key>CFBundleVersion</key>
