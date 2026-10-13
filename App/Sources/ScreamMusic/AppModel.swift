@@ -71,6 +71,12 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
 
     init() {
+        // After the first frame. poll()/launch() call into coreaudiod, which is busy for a minute
+        // or more after a driver install; doing that before the window exists looks like a hang.
+        DispatchQueue.main.async { [weak self] in self?.start() }
+    }
+
+    private func start() {
         poll()
         edit = destination
         musicMode.launch()
@@ -113,6 +119,12 @@ final class AppModel: ObservableObject {
         applyError = st == noErr ? nil : "The driver refused this destination (\(st)). Check the IP address and port."
         poll()
         if st == noErr { edit = destination }
+    }
+
+    func setLeadIn(_ ms: Int) {
+        guard let d = device else { return }
+        ScreamDevice.setInt(d, ScreamDevice.leadIn, ms)
+        poll()
     }
 
     func setRate(_ r: Double) {

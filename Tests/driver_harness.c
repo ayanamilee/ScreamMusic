@@ -432,6 +432,150 @@ static void case_music_filter(void)
     if (!failures) printf("ok   %-34s reader alone silent, Music bit-exact, others looped back, marker\n", "Apple Music mode filter");
 }
 
+/* Music is not running (SMmx 0) but the controlling app still owns the device: other apps go to
+ * the loopback and nothing is sent. Owner is this process, so the death check does not clear it. */
+static void case_others_without_music(void)
+{
+    add_client(21, 999021);
+    add_client(22, (UInt32)getpid());
+    set_int('SMac', (int)getpid());
+    set_int('SMmx', 0);
+    set_format(48000, kFloatFlags, 32);
+    reset_rx(SCREAM_DIALECT_EXTENDED);
+    set_int('SMbd', 24);
+    set_int('SMdl', 20);
+    (*gDrv)->StartIO(gDrv, kDevice, 22);
+
+    float other[512 * 2], mix[512 * 2], in[512 * 2];
+    for (int i = 0; i < 512 * 2; i++) other[i] = 0.25f;
+    Float64 t = 200000;   /* past the previous case's sample time */
+    io(21, kAudioServerPlugInIOOperationProcessOutput, other, 512, t);
+    bool zeroed = true;
+    for (int i = 0; i < 512 * 2; i++) if (other[i] != 0) zeroed = false;
+    memcpy(mix, other, sizeof mix);   /* the HAL mixes after ProcessOutput has zeroed it */
+    io(22, kAudioServerPlugInIOOperationWriteMix, mix, 512, t);
+    io(22, kAudioServerPlugInIOOperationReadInput, in, 512, t);
+    bool loop = true;
+    for (int i = 0; i < 512 * 2; i++) if (in[i] != 0.25f) loop = false;
+    usleep(80000);   /* past the send delay: a leaked mix would have left the socket */
+    pthread_mutex_lock(&gRxMutex);
+    CHECK(gSegCount == 0, "other apps were sent while Music was not running (%d segments)", gSegCount);
+    pthread_mutex_unlock(&gRxMutex);
+    CHECK(zeroed, "other app's buffer was not zeroed with Music pid 0");
+    CHECK(loop, "loopback silent while Music was not running");
+
+    (*gDrv)->StopIO(gDrv, kDevice, 22);
+    set_int('SMac', 0);
+    set_int('SMmx', 0);
+    if (!failures) printf("ok   %-34s others looped back with Music not running\n", "others without Music");
+}
+
+/* SMli: a run in a new wire format starts with at least the lead-in of zeros, then its audio
+ * bit-exact; a restart in the format the receiver already has gets none. */
+static size_t leading_zero_payloads(const rx_seg_t *s)
+{
+    size_t n = 0;
+    for (size_t off = 0; off + SCREAM_PAYLOAD_SIZE <= s->len; off += SCREAM_PAYLOAD_SIZE, n++) {
+        for (size_t i = 0; i < SCREAM_PAYLOAD_SIZE; i++)
+            if (s->data[off + i]) return n;
+    }
+    return n;
+}
+
+static void case_lead_in(void)
+{
+    const unsigned ms = 100;
+    size_t frames = 88200 / 4 + 7;
+    uint8_t *a = malloc(frames * 6), *b = malloc(frames * 6);
+    for (size_t i = 0; i < frames * 6; i++) { a[i] = (uint8_t)rnd(); b[i] = (uint8_t)rnd(); }
+    a[0] = b[0] = 1;   /* the audio's first payload is not all zeros */
+    set_int('SMli', ms);
+
+    /* 88.2k / 24-bit integer: no earlier case used it */
+    reset_rx(SCREAM_DIALECT_EXTENDED);
+    set_format(88200, kIntFlags, 24);
+    play(a, frames, 6, 88200);
+    usleep(400000);
+    pthread_mutex_lock(&gRxMutex);
+    size_t want = ((size_t)ms * 88200 * 6 / 1000 + SCREAM_PAYLOAD_SIZE - 1) / SCREAM_PAYLOAD_SIZE;
+    CHECK(gSegCount == 1 && gEOTs == 1, "lead-in: %d segments, %u markers", gSegCount, gEOTs);
+    if (gSegCount == 1) {
+        size_t z = leading_zero_payloads(&gSegs[0]);
+        size_t off = z * SCREAM_PAYLOAD_SIZE;
+        CHECK(z >= want && z <= want + 4, "lead-in: %zu zero payloads, want %zu", z, want);
+        CHECK(gSegs[0].len >= off + frames * 6 && memcmp(gSegs[0].data + off, a, frames * 6) == 0, "lead-in: audio after the silence");
+        if (!failures) printf("ok   %-34s %zu ms of silence, then audio bit-exact\n", "lead-in on a new format", z * SCREAM_PAYLOAD_SIZE * 1000 / (88200 * 6));
+    }
+    pthread_mutex_unlock(&gRxMutex);
+
+    /* the same format again (after its end-of-track marker): no lead-in */
+    reset_rx(SCREAM_DIALECT_EXTENDED);
+    play(b, frames, 6, 88200);
+    usleep(400000);
+    pthread_mutex_lock(&gRxMutex);
+    CHECK(gSegCount == 1, "no lead-in: %d segments", gSegCount);
+    if (gSegCount == 1) {
+        CHECK(leading_zero_payloads(&gSegs[0]) == 0, "same format got a lead-in");
+        CHECK(gSegs[0].len >= frames * 6 && memcmp(gSegs[0].data, b, frames * 6) == 0, "no lead-in: data");
+        if (!failures) printf("ok   %-34s none, audio from the first byte\n", "lead-in on the same format");
+    }
+    pthread_mutex_unlock(&gRxMutex);
+
+    /* SMlo = 0: the next format change only goes without a lead-in, the one after has it again */
+    reset_rx(SCREAM_DIALECT_EXTENDED);
+    size_t fo = 44100 / 4 + 5;
+    uint8_t *o1 = malloc(fo * 4), *o2 = malloc(fo * 4);
+    for (size_t i = 0; i < fo * 4; i++) { o1[i] = (uint8_t)rnd(); o2[i] = (uint8_t)rnd(); }
+    o1[0] = o2[0] = 1;
+    set_int('SMli', ms);
+    set_int('SMlo', 0);
+    set_format(44100, kIntFlags, 16);
+    play(o1, fo, 4, 44100);
+    set_format(48000, kIntFlags, 16);
+    play(o2, fo, 4, 48000);
+    usleep(400000);
+    pthread_mutex_lock(&gRxMutex);
+    CHECK(gSegCount == 2, "SMlo: %d segments", gSegCount);
+    if (gSegCount == 2) {
+        CHECK(leading_zero_payloads(&gSegs[0]) == 0, "SMlo=0: the change it was set for still got a lead-in");
+        CHECK(leading_zero_payloads(&gSegs[1]) >= 1, "SMlo: the change after it got no lead-in");
+        if (!failures) printf("ok   %-34s one change without, the next with\n", "lead-in override (SMlo)");
+    }
+    pthread_mutex_unlock(&gRxMutex);
+    free(o1);
+    free(o2);
+
+    /* a lead-in cut short by a restart (the device stops while the format switches) is owed again */
+    reset_rx(SCREAM_DIALECT_EXTENDED);
+    size_t fc = 96000 / 4 + 3;
+    uint8_t *c = malloc(fc * 6);
+    for (size_t i = 0; i < fc * 6; i++) c[i] = (uint8_t)rnd();
+    c[0] = 1;
+    set_int('SMli', 200);
+    set_format(96000, kIntFlags, 24);
+    (*gDrv)->StartIO(gDrv, kDevice, 1);
+    usleep(60000);                      /* 60 of the 200 ms */
+    (*gDrv)->StopIO(gDrv, kDevice, 1);
+    usleep(50000);
+    play(c, fc, 6, 96000);
+    usleep(400000);
+    pthread_mutex_lock(&gRxMutex);
+    size_t owed = ((size_t)200 * 96000 * 6 / 1000 + SCREAM_PAYLOAD_SIZE - 1) / SCREAM_PAYLOAD_SIZE;
+    CHECK(gSegCount == 1 && gEOTs == 1, "interrupted lead-in: %d segments, %u markers", gSegCount, gEOTs);
+    if (gSegCount >= 1) {
+        size_t z = leading_zero_payloads(&gSegs[gSegCount - 1]);
+        CHECK(z >= owed, "interrupted lead-in: %zu zero payloads, want %zu", z, owed);
+        CHECK(gSegs[gSegCount - 1].len >= z * SCREAM_PAYLOAD_SIZE + fc * 6 &&
+              memcmp(gSegs[gSegCount - 1].data + z * SCREAM_PAYLOAD_SIZE, c, fc * 6) == 0, "interrupted lead-in: audio");
+        if (!failures) printf("ok   %-34s lead-in owed again after a restart, one marker\n", "interrupted lead-in");
+    }
+    pthread_mutex_unlock(&gRxMutex);
+    free(c);
+    set_int('SMli', 0);
+    free(a);
+    free(b);
+}
+
 /* Float32 stream: track A, 50 ms of zeros, track B (Music's inter-track gap). */
 static size_t make_tracks(float **out, size_t *aFrames, size_t *gapFrames, Float64 rate)
 {
@@ -775,6 +919,7 @@ int main(int argc, char **argv)
     gStorage = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CHECK((*gDrv)->Initialize(gDrv, &gHostIf) == 0, "Initialize");
     set_int('SMdl', 20);
+    set_int('SMli', 0);       /* the cases below expect audio from the first byte; case_lead_in sets it */
 
     case_int(44100, 16, "int16 44.1k passthrough");
     case_int(96000, 24, "int24 96k passthrough");
@@ -786,6 +931,7 @@ int main(int argc, char **argv)
     set_destination("extended");
     case_restart();
     case_music_filter();
+    case_others_without_music();
     case_boundary_drop();
     case_boundary_release();
     case_gate();
@@ -794,6 +940,7 @@ int main(int argc, char **argv)
     case_mirror();
     case_music_long_buffers();
     case_gain_fit();
+    case_lead_in();
 
     /* settings persisted through the host's storage */
     CHECK(CFDictionaryGetValue(gStorage, CFSTR("destination")) != NULL, "destination not stored");
@@ -803,7 +950,7 @@ int main(int argc, char **argv)
         long long eots = 0, errs = -1;
         CFNumberGetValue(CFDictionaryGetValue(status, CFSTR("endOfTrackMarkers")), kCFNumberLongLongType, &eots);
         CFNumberGetValue(CFDictionaryGetValue(status, CFSTR("sendErrors")), kCFNumberLongLongType, &errs);
-        CHECK(eots == 20, "status endOfTrackMarkers %lld", eots);
+        CHECK(eots == 25, "status endOfTrackMarkers %lld", eots);
         CHECK(errs == 0, "status sendErrors %lld", errs);
         CFRelease(status);
     }

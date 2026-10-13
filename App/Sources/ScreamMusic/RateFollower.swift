@@ -94,19 +94,14 @@ final class RateFollower: @unchecked Sendable {
     /// An AAC decoder line was seen; the track is only called lossy if no lossless line of its own
     /// shows within 10 s of its start (streams often open AAC and swap in ALAC a second later).
     private var aacSeenAt: Date?
+    /// The Rate Library chose this track's start format / is only a grid-check candidate for it.
+    /// If the grid check then has to correct or give up, the entry was wrong: forget it.
+    private var libraryStart = false
+    private var libraryCandidate = false
     /// Learning: frames of clean windows since the last format change / track start.
     private var learnCleanFrames = 0
 
-    struct Fmt: Equatable {
-        var rate: Double
-        var bits: Int
-        func higher(than o: Fmt) -> Bool { rate > o.rate || (rate == o.rate && bits > o.bits) }
-        static func best(_ a: Fmt?, _ b: Fmt?) -> Fmt? {
-            guard let a else { return b }
-            guard let b else { return a }
-            return b.higher(than: a) ? b : a
-        }
-    }
+    typealias Fmt = WireFormat
     private var inSwitch = false
     private var armed: ScreamDevice.Hold = .run
     private var reachedSeenAt: Date?
@@ -127,7 +122,7 @@ final class RateFollower: @unchecked Sendable {
             let at = Date()
             self?.q.async { self?.handleInfo(info, at: at) }
         }
-        RateLibrary.shared.onError = { elog($0) }
+        RateLibrary.shared.setErrorHandler { elog($0) }
         gridTick()
         q.async { [self] in
             curRate = ScreamDevice.nominalRate(device) ?? 44100
@@ -146,6 +141,14 @@ final class RateFollower: @unchecked Sendable {
         }
     }
 
+    /// The library changed from outside (cleared in the UI): show its size.
+    func refreshLibraryCount() {
+        q.async { [self] in
+            state.libraryCount = RateLibrary.shared.count
+            publish()
+        }
+    }
+
     func stop() {
         if let o = observer { DistributedNotificationCenter.default().removeObserver(o) }
         observer = nil
@@ -158,6 +161,7 @@ final class RateFollower: @unchecked Sendable {
             ScreamDevice.setInt(device, ScreamDevice.hold, ScreamDevice.Hold.run.rawValue)
             armed = .run
         }
+        RateLibrary.shared.flush()
         elog("follower: stopped")
     }
 
@@ -247,6 +251,8 @@ final class RateFollower: @unchecked Sendable {
         trackLossy = false
         trackAtmos = false
         aacSeenAt = nil
+        libraryStart = false
+        libraryCandidate = false
         learnCleanFrames = 0
         state.trackName = name
 
@@ -256,24 +262,21 @@ final class RateFollower: @unchecked Sendable {
         let preRoll = lines.filter { $0.date > afterPrev && $0.date > (prevOwn ?? .distantPast) && $0.date <= at && $0.lossless && $0.bits != nil }
         let info = musicTrackInfo(name: name)
         let scriptRate = info?.rate
+        var learned: LearnedFormat?
         if let key = info?.key {
             currentKey = key
-            // The library has confirmed formats from actual plays; pre-roll lines and Music's own rate
-            // have both been wrong (streams settling on another variant), so it wins.
-            if let learned = RateLibrary.shared.lookup(key) {
-                let target = Fmt(rate: learned.rate, bits: learned.lossy ? 24 : learned.bits)
-                decide(target, name: name, tPlay: at, how: "rate library", manualStart: preRoll.isEmpty, lossy: learned.lossy)
-                return
-            }
-            // not played before: the album's other tracks are a candidate for the grid check
-            if let hint = info.flatMap({ $0.albumKey }).flatMap({ RateLibrary.shared.albumHint($0) }) {
-                let f = Fmt(rate: hint.rate, bits: hint.bits)
-                if f != Fmt(rate: curRate, bits: curBits) { maybeFormats.append(f) }
-            }
+            learned = RateLibrary.shared.lookup(key)
         }
-        if let best = preRoll.compactMap({ fmt(rate: $0.rate, bits: $0.bits) }).reduce(nil, { Fmt.best($0, $1) }) {
-            let target = Fmt.best(best, scriptRate.map { Fmt(rate: $0, bits: best.bits) })!
-            decide(target, name: name, tPlay: at, how: "pre-roll", manualStart: false)
+        // A pre-roll line (natural transition) outranks the library, which then only backs the grid
+        // check; a manual start has no pre-roll, so the library saves the wait for the decoder line.
+        let preRollBest = preRoll.compactMap({ fmt(rate: $0.rate, bits: $0.bits) }).reduce(nil, { Fmt.best($0, $1) })
+        if let choice = chooseStart(preRoll: preRollBest, scriptRate: scriptRate, learned: learned, followDepth: followDepth) {
+            if let c = choice.candidate {
+                maybeFormats.append(c)
+                libraryCandidate = true
+            }
+            libraryStart = choice.source == .library
+            decide(choice.target, name: name, tPlay: at, how: choice.source.rawValue, manualStart: choice.manualStart)
             return
         }
         // A manual start (picked, skipped, played from pause): no pre-roll. Hold where it begins and wait
@@ -303,8 +306,9 @@ final class RateFollower: @unchecked Sendable {
     /// The current track as Music reports it, if it is `name` (~1 s of retries: it reads
     /// "missing value", or still the previous track, right at a change). Also the track's Rate
     /// Library key: its persistent ID, else artist — album — name.
-    private func musicTrackInfo(name: String) -> (rate: Double?, key: String?, albumKey: String?)? {
+    private func musicTrackInfo(name: String) -> (rate: Double?, key: String?)? {
         guard musicRunning() else { return nil }
+        var last: (rate: Double?, key: String?)?
         for attempt in 0..<6 {
             if attempt > 0 { Thread.sleep(forTimeInterval: 0.15) }
             guard let t = scripts.trackInfo() else { continue }
@@ -312,15 +316,16 @@ final class RateFollower: @unchecked Sendable {
             let key: String?
             if !t.persistentID.isEmpty {
                 key = "pid:" + t.persistentID
+            } else if t.artist.isEmpty && t.album.isEmpty {
+                key = nil      // a bare title would collide with every other bare title (radio, streams)
             } else {
                 let k = RateLibrary.key(name: t.name, artist: t.artist, album: t.album)
                 key = k.isEmpty ? nil : k
             }
-            let ak = RateLibrary.albumKey(artist: t.artist, album: t.album)
-            let albumKey: String? = ak.isEmpty ? nil : ak
-            return (t.rate, key, albumKey)
+            last = (t.rate, key)
+            if t.rate != nil { return last }      // "missing value" right at a change: ask again
         }
-        return nil
+        return last
     }
 
     // MARK: - decoder lines
@@ -433,13 +438,27 @@ final class RateFollower: @unchecked Sendable {
         // Natural transition: switch at the boundary. A skip is caught when its Playing comes.
         guard playing, armed == .run, let next = line, next != Fmt(rate: curRate, bits: curBits) else { return }
         let left = musicRunning() ? (scripts.remaining() ?? 0) : 0
+        if left > Self.preRollLeft {
+            // far from the end: not a pre-roll but a track the user picked, whose decoder comes up a
+            // moment before its Playing. Hold at the cut now, while it is still ahead of the sender
+            // (400 ms behind), so nothing of the new track goes out at the old rate.
+            arm(.boundary, expiry: 2)
+            elog("a \(Int(rate)) Hz line with \(String(format: "%.1f", left)) s left: probably a skip; boundary armed now")
+            return
+        }
         scheduleArm(after: max(0, left - 1.5))
         elog("next track needs \(Int(rate)) Hz; \(String(format: "%.1f", left)) s left: boundary armed in \(String(format: "%.1f", max(0, left - 1.5))) s")
     }
 
+    /// Music sets the next track's decoder up 8-12 s before the end; a line with more left than this
+    /// belongs to a track about to start now.
+    private static let preRollLeft: TimeInterval = 20
+
     /// How long after a track's Playing its own decoder lines may still come (a stream's higher
     /// variant: ~2-3 s in, later on a slow network).
     private static let trackWindow: TimeInterval = 10
+    /// After the play command: lets what the seek left in Music's buffers flow into the drop.
+    private static let rewindSettle: TimeInterval = 0.08
     /// The grid check's window.
     private static let gridInterval: TimeInterval = 0.5
     /// How long a manual start waits for the track's decoder line.
@@ -488,6 +507,10 @@ final class RateFollower: @unchecked Sendable {
         let t0 = Date()
         let from = "\(Int(curRate)) Hz / \(curBits)-bit"
         release("upgrade")
+        // A stream's own variant upgrade (48 -> 96 kHz a few seconds in) has no rewind to hide a
+        // lead-in in: it would add half a second of silence to a gap Music already makes. The
+        // driver applies this to the next format change only (older drivers refuse it: ignored).
+        ScreamDevice.setInt(device, ScreamDevice.leadOnce, 0)
         if f.bits != curBits { ScreamDevice.setInt(device, ScreamDevice.wireBits, f.bits) }
         if f.rate != curRate {
             ScreamDevice.setNominalRate(device, f.rate)
@@ -542,8 +565,16 @@ final class RateFollower: @unchecked Sendable {
         var startPos = pos - played - 0.1
         if startPos < 2 { startPos = 0.001 }    // not 0: Music takes "set to 0" for a no-op
         scripts.setPosition(startPos)
+        // Keep dropping through the rewind and the play command. Music answers the seek with ~36 ms
+        // of the track's start, then nothing for the ~0.4 s the play command takes: released before
+        // play, that fragment went out, then a hole of zeros, then the track again (a stutter).
+        if wasPlaying || playing {
+            scripts.play()
+            let end = Date().addingTimeInterval(0.5)
+            while Date() < end, scripts.playerState() != "playing" { Thread.sleep(forTimeInterval: 0.02) }
+            Thread.sleep(forTimeInterval: Self.rewindSettle)
+        }
         setHold(.run)
-        if wasPlaying || playing { scripts.play() }
         ownLinesUntil = max(ownLinesUntil ?? .distantPast, Date().addingTimeInterval(1))
         state.switches += 1
         state.lastAction = "switched to \(rateText(curRate)) / \(curBits)-bit"
@@ -600,7 +631,9 @@ final class RateFollower: @unchecked Sendable {
             guard serial == armSerial, !inSwitch, armed == h else { return }
             if holdReached() {
                 if reachedSeenAt == nil { reachedSeenAt = Date() }
-                if Date().timeIntervalSince(reachedSeenAt!) > 1.0, (lastNewTrackAt ?? .distantPast) < since {
+                // not while a new track is waiting for its decoder line (up to startWait): that hold is
+                // deliberate, and releasing it let the new track's first second out at the old rate
+                if awaiting == nil, Date().timeIntervalSince(reachedSeenAt!) > 1.0, (lastNewTrackAt ?? .distantPast) < since {
                     release("reached but no new track: a silence inside the track")
                     return
                 }
@@ -690,11 +723,13 @@ final class RateFollower: @unchecked Sendable {
         guard gridFixes < 3, let f = candidates.first(where: { !gridTried.contains($0) }) else {
             if gridFixes < 3 {
                 gridFixes = 3
+                forgetLibraryEntry(if: libraryStart || libraryCandidate)
                 elog("grid check: \(state.trackName) is off the \(curBits)-bit grid (\(Int(ratio * 100))%) and its decoder showed no other format: not bit-perfect (lossy, or processed in Music)")
             }
             return
         }
         gridFixes += 1
+        forgetLibraryEntry(if: libraryStart)
         elog("grid check: \(state.trackName) is off the \(curBits)-bit grid at \(Int(curRate)) Hz (\(Int(ratio * 100))% of samples); its decoder showed \(Int(f.rate)) Hz / \(f.bits)-bit (try \(gridFixes))")
         trackTarget = f
         state.trackRate = f.rate
@@ -704,17 +739,26 @@ final class RateFollower: @unchecked Sendable {
 
     // MARK: - rate library
 
+    /// The Rate Library's format for this track did not hold up on the grid: drop it so the next play
+    /// is decided on fresh evidence (the track is learned again if it ends up clean).
+    private func forgetLibraryEntry(if wrong: Bool) {
+        guard wrong, let key = currentKey, RateLibrary.shared.lookup(key) != nil else { return }
+        RateLibrary.shared.remove(key)
+        libraryStart = false
+        libraryCandidate = false
+        state.libraryCount = RateLibrary.shared.count
+        elog("rate library: dropped \(state.trackName) (its remembered format did not match the audio)")
+    }
+
     /// Records the outgoing track's outcome (a track that played clean ≥ 10 s after its last format
     /// change counts as confirmed; a lossy/Atmos one is remembered as lossy so nothing chases it).
     private func finalizeLearning() {
         guard let key = currentKey else { return }
         currentKey = nil
         let cleanSeconds = learnCleanFrames > 0 && curRate > 0 ? Double(learnCleanFrames) / curRate : 0
-        if trackLossy || trackAtmos {
-            RateLibrary.shared.learn(key, rate: trackTarget?.rate ?? curRate, bits: 24, lossy: true)
-            elog("rate library: \(state.trackName) learned as lossy")
-        } else if cleanSeconds >= 10 {
-            RateLibrary.shared.learn(key, rate: curRate, bits: curBits, lossy: false)
+        // lossy / Atmos plays teach nothing (never on the grid, nothing to reuse)
+        if !trackLossy && !trackAtmos && cleanSeconds >= 10 {
+            RateLibrary.shared.learn(key, rate: curRate, bits: curBits)
             elog("rate library: \(state.trackName) learned \(Int(curRate)) Hz / \(curBits)-bit (\(Int(cleanSeconds)) s clean)")
         }
         learnCleanFrames = 0
