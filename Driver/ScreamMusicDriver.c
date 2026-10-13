@@ -43,12 +43,18 @@
 #define kDriver_Manufacturer  "ScreamMusic"
 #define kDevice_UID           "ScreamMusic_UID"
 #define kDevice_ModelUID      "ScreamMusic_ModelUID"
+/* The Apple Music loopback: an input-only device carrying what would have been sent (SMlb) */
+#define kAMDevice_Name        "ScreamMusic AM"
+#define kAMDevice_UID         "ScreamMusic_AM_UID"
+#define kAMDevice_ModelUID    "ScreamMusic_AM_ModelUID"
 
 enum {
     kObjectID_PlugIn        = kAudioObjectPlugInObject,
     kObjectID_Device        = 2,
     kObjectID_Stream_Output = 3,
     kObjectID_Stream_Input  = 4,
+    kObjectID_Device_AM     = 5,
+    kObjectID_Stream_AM_Input = 6,
 };
 
 /* Custom properties (DESIGN.md §4.4). All are CFPropertyList-typed. */
@@ -64,6 +70,7 @@ enum {
     kSM_Owner       = 'SMac',   /* CFNumber, the controlling app's pid (cleanup when it dies) */
     kSM_Mirror      = 'SMmr',   /* CFDictionary {ip, port}: also send every packet there (diagnostics); {} = off */
     kSM_LeadIn      = 'SMli',   /* CFNumber, milliseconds of silence before a new wire format (relock) */
+    kSM_Loopback    = 'SMlb',   /* CFNumber 0/1: Apple Music goes to the ScreamMusic AM input instead of the network */
     kSM_LeadOnce    = 'SMlo',   /* CFNumber, ms of lead-in for the next format change only (0 = none); expires */
 };
 
@@ -187,6 +194,11 @@ static UInt32 gIOCount;                    /* StartIO count: the clock and the r
 static UInt64 gAnchorHost;
 static UInt64 gNumTimeStamps;
 static UInt64 gClockSeed = 1;
+/* The ScreamMusic AM device runs its own IO count and clock (same rate); its IO never starts a run. */
+static UInt32 gIOCount_AM;
+static UInt64 gAnchorHost_AM;
+static UInt64 gNumTimeStamps_AM;
+static UInt64 gClockSeed_AM = 1;
 static Float64 gHostTicksPerFrame;
 static Float64 gHostTicksPerSecond;
 
@@ -203,6 +215,19 @@ static stream_t gStream;
 /* SPSC ring: IO thread writes, sender reads. Byte counters only grow. */
 static uint8_t gRing[kRingBytes];
 static _Atomic uint64_t gRingWrite, gRingRead;
+
+/* Apple Music loopback (SMlb): Float32 stereo frames the sender thread produces instead of packets,
+ * read by the ScreamMusic AM device's IO. One producer (sender), one consumer (AM IO thread). */
+#define kLoopFrames           (1u << 19)
+#define kLoopCushionMs        20           /* the reader waits for this much before it starts */
+static float gLoopBuf[kLoopFrames * 2];
+static _Atomic uint64_t gLoopW;            /* frames written */
+static _Atomic unsigned gLoopFlush;        /* bumped when the stream's wire format changes */
+static _Atomic bool gLoopback;
+static _Atomic uint64_t gStatLoopFrames, gStatLoopUnderruns, gStatLoopSkips;
+static uint64_t gLoopR;                    /* consumer only: frames read */
+static unsigned gLoopSeenFlush;
+static bool gLoopStarted;
 
 /* Others loopback (Apple Music mode), IO thread only. */
 static Float32 gOthers[kOthersFrames * kChannels];
@@ -411,6 +436,10 @@ static void save_settings(void)
     n = CFNumberCreate(NULL, kCFNumberIntType, &ms);
     gHost->WriteToStorage(gHost, CFSTR("lead_in_ms"), n);
     CFRelease(n);
+    ms = atomic_load(&gLoopback) ? 1 : 0;
+    n = CFNumberCreate(NULL, kCFNumberIntType, &ms);
+    gHost->WriteToStorage(gHost, CFSTR("loopback"), n);
+    CFRelease(n);
 }
 
 static void load_settings(void)
@@ -433,6 +462,13 @@ static void load_settings(void)
         int ms;
         if (CFGetTypeID(p) == CFNumberGetTypeID() && CFNumberGetValue(p, kCFNumberIntType, &ms) && ms >= 0 && ms <= (int)kMaxLeadInMs)
             atomic_store(&gLeadInMs, (unsigned)ms);
+        CFRelease(p);
+    }
+    p = NULL;
+    if (gHost->CopyFromStorage(gHost, CFSTR("loopback"), &p) == 0 && p) {
+        int on;
+        if (CFGetTypeID(p) == CFNumberGetTypeID() && CFNumberGetValue(p, kCFNumberIntType, &on))
+            atomic_store(&gLoopback, on != 0);
         CFRelease(p);
     }
 }
@@ -496,6 +532,10 @@ static CFDictionaryRef copy_status(void)
     dict_set_u64(d, CFSTR("endOfTrackMarkers"), atomic_load(&gStatEOTs));
     dict_set_u64(d, CFSTR("delayMs"), atomic_load(&gDelayMs));
     dict_set_u64(d, CFSTR("leadInMs"), atomic_load(&gLeadInMs));
+    dict_set_u64(d, CFSTR("loopback"), atomic_load(&gLoopback) ? 1 : 0);
+    dict_set_u64(d, CFSTR("loopFrames"), atomic_load(&gStatLoopFrames));
+    dict_set_u64(d, CFSTR("loopUnderruns"), atomic_load(&gStatLoopUnderruns));
+    dict_set_u64(d, CFSTR("loopSkips"), atomic_load(&gStatLoopSkips));
     dict_set_u64(d, CFSTR("musicPID"), (uint64_t)atomic_load(&gMusicPID));
     dict_set_u64(d, CFSTR("ownerPID"), (uint64_t)atomic_load(&gOwnerPID));
     dict_set_u64(d, CFSTR("holdMode"), (uint64_t)atomic_load(&gHoldMode));
@@ -578,6 +618,7 @@ static void send_packet(sock_t *s, const uint8_t *pkt, size_t len)
 {
     if (s->fd < 0) return;
     if (s->mirrorOn) sendto(s->fd, pkt, len, 0, (const struct sockaddr *)&s->mirror, sizeof s->mirror);
+    if (atomic_load_explicit(&gLoopback, memory_order_relaxed)) return;     /* SMlb: not on the network */
     ssize_t r = sendto(s->fd, pkt, len, 0, (const struct sockaddr *)&s->addr, sizeof s->addr);
     if (r < 0) {
         atomic_fetch_add(&gStatSendErrors, 1);
@@ -612,15 +653,34 @@ static void ring_skip_to(uint64_t pos)
         atomic_store_explicit(&gRingRead, pos, memory_order_release);
 }
 
+/* SMlb: what would go out as one payload goes to the loopback ring as Float32 (exact for 16/24-bit audio). */
+static void loop_push(const stream_t *st, const uint8_t *payload)
+{
+    unsigned fb = scream_frame_bytes(st->wire);
+    size_t frames = SCREAM_PAYLOAD_SIZE / fb;
+    float tmp[SCREAM_PAYLOAD_SIZE / 4 * 2];
+    scream_unpack_float(tmp, payload, frames * SCREAM_CHANNELS, st->wire);
+    uint64_t w = atomic_load_explicit(&gLoopW, memory_order_relaxed);
+    for (size_t i = 0; i < frames; i++) {
+        size_t k = (size_t)((w + i) % kLoopFrames) * 2;
+        gLoopBuf[k] = tmp[i * 2];
+        gLoopBuf[k + 1] = tmp[i * 2 + 1];
+    }
+    atomic_store_explicit(&gLoopW, w + frames, memory_order_release);
+}
+
 /* Header and payload use the run's snapshot; the dialect is the destination's at the run's start. */
 static void send_payload(sock_t *s, const stream_t *st, const uint8_t *payload)
 {
+    if (atomic_load_explicit(&gLoopback, memory_order_relaxed)) loop_push(st, payload);
     uint8_t pkt[SCREAM_PACKET_SIZE_MAX];
     unsigned h = scream_encode_header(pkt, st->rate, st->wire, st->dialect, false);
     memcpy(pkt + h, payload, SCREAM_PAYLOAD_SIZE);
     send_packet(s, pkt, h + SCREAM_PAYLOAD_SIZE);
-    atomic_fetch_add(&gStatPackets, 1);
-    atomic_fetch_add(&gStatBytes, SCREAM_PAYLOAD_SIZE);
+    if (!atomic_load_explicit(&gLoopback, memory_order_relaxed)) {      /* SMlb: frames go to loopFrames instead */
+        atomic_fetch_add(&gStatPackets, 1);
+        atomic_fetch_add(&gStatBytes, SCREAM_PAYLOAD_SIZE);
+    }
 }
 
 /* UDP end-of-track marker: header only, as snd-screamalsa's scream_send_last_packet(). */
@@ -813,6 +873,7 @@ static void *sender_main(void *arg)
             ring_skip_to(startPos);         /* nothing of the old run is pending on the wire */
         }
         /* else: same format, still streaming: the old tail flows straight into the new run */
+        if (!same_wire(&st, &next)) atomic_fetch_add(&gLoopFlush, 1);     /* SMlb reader: drop the old rate's samples */
         myGen = gen;
         st = next;
 
@@ -1139,7 +1200,9 @@ static OSStatus SM_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id)
 
 static OSStatus SM_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, const AudioServerPlugInClientInfo *info)
 {
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) return 0;
+    if (inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
     if (gClientCount < kMaxClients) {
         memset(&gClients[gClientCount], 0, sizeof gClients[0]);
@@ -1157,7 +1220,9 @@ static OSStatus SM_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObj
 
 static OSStatus SM_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, const AudioServerPlugInClientInfo *info)
 {
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) return 0;
+    if (inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
     for (int i = 0; i < gClientCount; i++) {
         if (gClients[i].clientID == info->mClientID) {
@@ -1174,7 +1239,7 @@ static OSStatus SM_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, Audio
 static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt64 action, void *info)
 {
     (void)action; (void)info;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gIOMutex);
     pthread_mutex_lock(&gStateMutex);
     if (gPendingRate > 0) {
@@ -1188,6 +1253,17 @@ static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef i
     update_clock_rate();
     os_log(gLog, "ScreamMusic: now %.0f Hz, format %d", gRate, (int)gFormat);
     pthread_mutex_unlock(&gStateMutex);
+    if (inDevice == kObjectID_Device_AM) {     /* the same rate, its own clock and reader */
+        if (gIOCount_AM) {
+            gAnchorHost_AM = mach_absolute_time();
+            gNumTimeStamps_AM = 0;
+            gClockSeed_AM++;
+        }
+        gLoopStarted = false;
+        gLoopR = atomic_load_explicit(&gLoopW, memory_order_acquire);
+        pthread_mutex_unlock(&gIOMutex);
+        return 0;
+    }
     /* IO may resume without a new StartIO: restart the clock and the run with the new format */
     if (gIOCount) {
         gAnchorHost = mach_absolute_time();
@@ -1202,7 +1278,7 @@ static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef i
 static OSStatus SM_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt64 action, void *info)
 {
     (void)action; (void)info;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
     gPendingRate = 0;
     gPendingFormat = -1;
@@ -1244,7 +1320,7 @@ static OSStatus plugin_size(const AudioObjectPropertyAddress *a, UInt32 *out)
     case kAudioObjectPropertyManufacturer:
     case kAudioPlugInPropertyResourceBundle: *out = sizeof(CFStringRef); return 0;
     case kAudioObjectPropertyOwnedObjects:
-    case kAudioPlugInPropertyDeviceList:     *out = sizeof(AudioObjectID); return 0;
+    case kAudioPlugInPropertyDeviceList:     *out = 2 * sizeof(AudioObjectID); return 0;
     case kAudioPlugInPropertyBoxList:        *out = 0; return 0;
     case kAudioPlugInPropertyTranslateUIDToBox:
     case kAudioPlugInPropertyTranslateUIDToDevice: *out = sizeof(AudioObjectID); return 0;
@@ -1263,9 +1339,14 @@ static OSStatus plugin_get(const AudioObjectPropertyAddress *a, UInt32 qSize, co
     case kAudioPlugInPropertyResourceBundle: WRITE_VALUE(CFStringRef, CFSTR("")); return 0;
     case kAudioObjectPropertyOwnedObjects:
     case kAudioPlugInPropertyDeviceList:
-        if (inDataSize < sizeof(AudioObjectID)) { *outDataSize = 0; return 0; }
-        WRITE_VALUE(AudioObjectID, kObjectID_Device);
-        return 0;
+        {
+            AudioObjectID ids[2] = {kObjectID_Device, kObjectID_Device_AM};
+            UInt32 n = inDataSize / sizeof(AudioObjectID);
+            if (n > 2) n = 2;
+            memcpy(outData, ids, n * sizeof(AudioObjectID));
+            *outDataSize = n * sizeof(AudioObjectID);
+            return 0;
+        }
     case kAudioPlugInPropertyBoxList:
         *outDataSize = 0;
         return 0;
@@ -1275,7 +1356,10 @@ static OSStatus plugin_get(const AudioObjectPropertyAddress *a, UInt32 qSize, co
     case kAudioPlugInPropertyTranslateUIDToDevice: {
         if (qSize != sizeof(CFStringRef) || !qData) return kAudioHardwareBadPropertySizeError;
         CFStringRef uid = *(const CFStringRef *)qData;
-        WRITE_VALUE(AudioObjectID, CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo ? kObjectID_Device : kAudioObjectUnknown);
+        AudioObjectID found = kAudioObjectUnknown;
+        if (CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) found = kObjectID_Device;
+        else if (CFStringCompare(uid, CFSTR(kAMDevice_UID), 0) == kCFCompareEqualTo) found = kObjectID_Device_AM;
+        WRITE_VALUE(AudioObjectID, found);
         return 0;
     }
     }
@@ -1288,7 +1372,7 @@ static OSStatus plugin_get(const AudioObjectPropertyAddress *a, UInt32 qSize, co
 static const AudioServerPlugInCustomPropertyInfo kCustomProps[] = {
     CUSTOM(kSM_Destination), CUSTOM(kSM_Status), CUSTOM(kSM_EndOfTrack), CUSTOM(kSM_SendDelay),
     CUSTOM(kSM_WireBits), CUSTOM(kSM_MusicPID), CUSTOM(kSM_Hold), CUSTOM(kSM_HoldReached), CUSTOM(kSM_Owner),
-    CUSTOM(kSM_Mirror), CUSTOM(kSM_LeadIn), CUSTOM(kSM_LeadOnce),
+    CUSTOM(kSM_Mirror), CUSTOM(kSM_LeadIn), CUSTOM(kSM_LeadOnce), CUSTOM(kSM_Loopback),
 };
 #define kNumCustomProps (sizeof kCustomProps / sizeof kCustomProps[0])
 
@@ -1300,15 +1384,19 @@ static bool is_custom(AudioObjectPropertySelector s)
 }
 
 /* Streams of a scope: output, input, or both (global). */
-static UInt32 device_streams(AudioObjectPropertyScope s, AudioObjectID out[2])
+static UInt32 device_streams(AudioObjectID dev, AudioObjectPropertyScope s, AudioObjectID out[2])
 {
     UInt32 n = 0;
+    if (dev == kObjectID_Device_AM) {      /* the AM device only has its input */
+        if (s == kAudioObjectPropertyScopeGlobal || s == kAudioObjectPropertyScopeInput) out[n++] = kObjectID_Stream_AM_Input;
+        return n;
+    }
     if (s == kAudioObjectPropertyScopeGlobal || s == kAudioObjectPropertyScopeOutput) out[n++] = kObjectID_Stream_Output;
     if (s == kAudioObjectPropertyScopeGlobal || s == kAudioObjectPropertyScopeInput) out[n++] = kObjectID_Stream_Input;
     return n;
 }
 
-static Boolean device_has(const AudioObjectPropertyAddress *a)
+static Boolean device_has(AudioObjectID dev, const AudioObjectPropertyAddress *a)
 {
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass:
@@ -1338,11 +1426,15 @@ static Boolean device_has(const AudioObjectPropertyAddress *a)
     case kAudioDevicePropertyPreferredChannelsForStereo:
         return true;
     }
-    return is_custom(a->mSelector);
+    return dev == kObjectID_Device && is_custom(a->mSelector);
 }
 
-static OSStatus device_settable(const AudioObjectPropertyAddress *a, Boolean *out)
+static OSStatus device_settable(AudioObjectID dev, const AudioObjectPropertyAddress *a, Boolean *out)
 {
+    if (dev == kObjectID_Device_AM) {      /* the AM input follows the main device; nothing to set */
+        *out = false;
+        return device_has(dev, a) ? 0 : kAudioHardwareUnknownPropertyError;
+    }
     switch (a->mSelector) {
     case kAudioDevicePropertyNominalSampleRate:
     case kSM_Destination:
@@ -1350,6 +1442,7 @@ static OSStatus device_settable(const AudioObjectPropertyAddress *a, Boolean *ou
     case kSM_SendDelay:
     case kSM_LeadIn:
     case kSM_LeadOnce:
+    case kSM_Loopback:
     case kSM_WireBits:
     case kSM_MusicPID:
     case kSM_Hold:
@@ -1359,10 +1452,10 @@ static OSStatus device_settable(const AudioObjectPropertyAddress *a, Boolean *ou
         return 0;
     }
     *out = false;
-    return device_has(a) ? 0 : kAudioHardwareUnknownPropertyError;
+    return device_has(dev, a) ? 0 : kAudioHardwareUnknownPropertyError;
 }
 
-static OSStatus device_size(const AudioObjectPropertyAddress *a, UInt32 *out)
+static OSStatus device_size(AudioObjectID dev, const AudioObjectPropertyAddress *a, UInt32 *out)
 {
     AudioObjectID streams[2];
     switch (a->mSelector) {
@@ -1374,7 +1467,7 @@ static OSStatus device_size(const AudioObjectPropertyAddress *a, UInt32 *out)
     case kAudioDevicePropertyDeviceUID:
     case kAudioDevicePropertyModelUID:           *out = sizeof(CFStringRef); return 0;
     case kAudioObjectPropertyOwnedObjects:
-    case kAudioDevicePropertyStreams:            *out = device_streams(a->mScope, streams) * sizeof(AudioObjectID); return 0;
+    case kAudioDevicePropertyStreams:            *out = device_streams(dev, a->mScope, streams) * sizeof(AudioObjectID); return 0;
     case kAudioDevicePropertyRelatedDevices:     *out = sizeof(AudioObjectID); return 0;
     case kAudioObjectPropertyControlList:        *out = 0; return 0;
     case kAudioDevicePropertyTransportType:
@@ -1390,9 +1483,9 @@ static OSStatus device_size(const AudioObjectPropertyAddress *a, UInt32 *out)
     case kAudioDevicePropertyNominalSampleRate:  *out = sizeof(Float64); return 0;
     case kAudioDevicePropertyAvailableNominalSampleRates: *out = kNumRates * sizeof(AudioValueRange); return 0;
     case kAudioDevicePropertyPreferredChannelsForStereo: *out = 2 * sizeof(UInt32); return 0;
-    case kAudioObjectPropertyCustomPropertyInfoList: *out = sizeof kCustomProps; return 0;
+    case kAudioObjectPropertyCustomPropertyInfoList: *out = dev == kObjectID_Device_AM ? 0 : sizeof kCustomProps; return 0;
     }
-    if (is_custom(a->mSelector)) { *out = sizeof(CFPropertyListRef); return 0; }
+    if (dev == kObjectID_Device && is_custom(a->mSelector)) { *out = sizeof(CFPropertyListRef); return 0; }
     return kAudioHardwareUnknownPropertyError;
 }
 
@@ -1401,44 +1494,44 @@ static CFNumberRef number_i(int v)
     return CFNumberCreate(NULL, kCFNumberIntType, &v);
 }
 
-static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
+static OSStatus device_get(AudioObjectID dev, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
 {
     bool input = a->mScope == kAudioObjectPropertyScopeInput;
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass:   WRITE_VALUE(AudioClassID, kAudioObjectClassID); return 0;
     case kAudioObjectPropertyClass:       WRITE_VALUE(AudioClassID, kAudioDeviceClassID); return 0;
     case kAudioObjectPropertyOwner:       WRITE_VALUE(AudioObjectID, kObjectID_PlugIn); return 0;
-    case kAudioObjectPropertyName:        WRITE_VALUE(CFStringRef, CFSTR(kDriver_Name)); return 0;
+    case kAudioObjectPropertyName:        WRITE_VALUE(CFStringRef, dev == kObjectID_Device_AM ? CFSTR(kAMDevice_Name) : CFSTR(kDriver_Name)); return 0;
     case kAudioObjectPropertyManufacturer: WRITE_VALUE(CFStringRef, CFSTR(kDriver_Manufacturer)); return 0;
-    case kAudioDevicePropertyDeviceUID:   WRITE_VALUE(CFStringRef, CFSTR(kDevice_UID)); return 0;
-    case kAudioDevicePropertyModelUID:    WRITE_VALUE(CFStringRef, CFSTR(kDevice_ModelUID)); return 0;
+    case kAudioDevicePropertyDeviceUID:   WRITE_VALUE(CFStringRef, dev == kObjectID_Device_AM ? CFSTR(kAMDevice_UID) : CFSTR(kDevice_UID)); return 0;
+    case kAudioDevicePropertyModelUID:    WRITE_VALUE(CFStringRef, dev == kObjectID_Device_AM ? CFSTR(kAMDevice_ModelUID) : CFSTR(kDevice_ModelUID)); return 0;
     case kAudioObjectPropertyOwnedObjects:
     case kAudioDevicePropertyStreams: {
         AudioObjectID streams[2];
-        UInt32 n = device_streams(a->mScope, streams);
+        UInt32 n = device_streams(dev, a->mScope, streams);
         if (n > inDataSize / sizeof(AudioObjectID)) n = inDataSize / sizeof(AudioObjectID);
         memcpy(outData, streams, n * sizeof(AudioObjectID));
         *outDataSize = n * sizeof(AudioObjectID);
         return 0;
     }
-    case kAudioDevicePropertyRelatedDevices: WRITE_VALUE(AudioObjectID, kObjectID_Device); return 0;
+    case kAudioDevicePropertyRelatedDevices: WRITE_VALUE(AudioObjectID, dev); return 0;
     case kAudioObjectPropertyControlList: *outDataSize = 0; return 0;
     case kAudioDevicePropertyTransportType: WRITE_VALUE(UInt32, kAudioDeviceTransportTypeVirtual); return 0;
     case kAudioDevicePropertyClockDomain: WRITE_VALUE(UInt32, 0); return 0;
     case kAudioDevicePropertyDeviceIsAlive: WRITE_VALUE(UInt32, 1); return 0;
     case kAudioDevicePropertyDeviceIsRunning: {
         pthread_mutex_lock(&gIOMutex);
-        UInt32 running = gIOCount > 0;
+        UInt32 running = (dev == kObjectID_Device_AM ? gIOCount_AM : gIOCount) > 0;
         pthread_mutex_unlock(&gIOMutex);
         WRITE_VALUE(UInt32, running);
         return 0;
     }
     /* never the default input (that is the others loopback) nor the alert device */
-    case kAudioDevicePropertyDeviceCanBeDefaultDevice: WRITE_VALUE(UInt32, input ? 0 : 1); return 0;
+    case kAudioDevicePropertyDeviceCanBeDefaultDevice: WRITE_VALUE(UInt32, (input || dev == kObjectID_Device_AM) ? 0 : 1); return 0;
     case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: WRITE_VALUE(UInt32, 0); return 0;
     case kAudioDevicePropertyLatency: {
         pthread_mutex_lock(&gStateMutex);
-        UInt32 frames = input ? 0 : delay_frames();
+        UInt32 frames = (input || dev == kObjectID_Device_AM) ? 0 : delay_frames();
         pthread_mutex_unlock(&gStateMutex);
         WRITE_VALUE(UInt32, frames);
         return 0;
@@ -1471,6 +1564,7 @@ static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
     case kAudioObjectPropertyCustomPropertyInfoList: {
         UInt32 n = inDataSize / sizeof(AudioServerPlugInCustomPropertyInfo);
         if (n > kNumCustomProps) n = kNumCustomProps;
+        if (dev == kObjectID_Device_AM) n = 0;
         memcpy(outData, kCustomProps, n * sizeof(AudioServerPlugInCustomPropertyInfo));
         *outDataSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
         return 0;
@@ -1480,6 +1574,7 @@ static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
     case kSM_EndOfTrack:  WRITE_VALUE(CFPropertyListRef, number_i(0)); return 0;
     case kSM_SendDelay:   WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gDelayMs))); return 0;
     case kSM_LeadIn:      WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gLeadInMs))); return 0;
+    case kSM_Loopback:    WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gLoopback) ? 1 : 0)); return 0;
     case kSM_LeadOnce:    WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gLeadOnceMs))); return 0;
     case kSM_WireBits:    WRITE_VALUE(CFPropertyListRef, number_i((int)atomic_load(&gWantBits))); return 0;
     case kSM_MusicPID:    WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gMusicPID))); return 0;
@@ -1511,11 +1606,18 @@ static bool cf_int(CFPropertyListRef p, int *out)
 static OSStatus request_change(void)
 {
     if (!gHost) return 0;
-    return gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, 0, NULL);
+    pthread_mutex_lock(&gStateMutex);
+    bool rate = gPendingRate > 0;
+    pthread_mutex_unlock(&gStateMutex);
+    OSStatus st = gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, 0, NULL);
+    /* the AM input follows a rate change (a wire-depth change alone does not concern it) */
+    if (rate) gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device_AM, 0, NULL);
+    return st;
 }
 
-static OSStatus device_set(const AudioObjectPropertyAddress *a, UInt32 inDataSize, const void *inData)
+static OSStatus device_set(AudioObjectID dev, const AudioObjectPropertyAddress *a, UInt32 inDataSize, const void *inData)
 {
+    if (dev == kObjectID_Device_AM) return kAudioHardwareUnsupportedOperationError;
     if (a->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (inDataSize != sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         Float64 r = *(const Float64 *)inData;
@@ -1574,6 +1676,12 @@ static OSStatus device_set(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
         if (v < 0 || v > (int)kMaxLeadInMs) return kAudioHardwareIllegalOperationError;
         atomic_store(&gLeadInMs, (unsigned)v);
         save_settings();
+        return 0;
+    case kSM_Loopback:
+        if (v != 0 && v != 1) return kAudioHardwareIllegalOperationError;
+        atomic_store(&gLoopback, v == 1);
+        save_settings();
+        os_log(gLog, "ScreamMusic: %{public}s", v ? "loopback: Apple Music goes to ScreamMusic AM" : "Scream: Apple Music goes to the network");
         return 0;
     case kSM_LeadOnce:      /* not persisted: it belongs to the format change that follows */
         if (v < -1 || v > (int)kMaxLeadInMs) return kAudioHardwareIllegalOperationError;
@@ -1669,12 +1777,12 @@ static OSStatus stream_size(bool input, const AudioObjectPropertyAddress *a, UIn
     return kAudioHardwareUnknownPropertyError;
 }
 
-static OSStatus stream_get(bool input, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
+static OSStatus stream_get(bool input, AudioObjectID owner, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
 {
     switch (a->mSelector) {
     case kAudioObjectPropertyBaseClass:   WRITE_VALUE(AudioClassID, kAudioObjectClassID); return 0;
     case kAudioObjectPropertyClass:       WRITE_VALUE(AudioClassID, kAudioStreamClassID); return 0;
-    case kAudioObjectPropertyOwner:       WRITE_VALUE(AudioObjectID, kObjectID_Device); return 0;
+    case kAudioObjectPropertyOwner:       WRITE_VALUE(AudioObjectID, owner); return 0;
     case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return 0;
     case kAudioStreamPropertyIsActive:    WRITE_VALUE(UInt32, 1); return 0;
     case kAudioStreamPropertyDirection:   WRITE_VALUE(UInt32, input ? 1 : 0); return 0;
@@ -1731,7 +1839,12 @@ static OSStatus stream_set(bool input, const AudioObjectPropertyAddress *a, UInt
 
 static bool is_stream(AudioObjectID obj)
 {
-    return obj == kObjectID_Stream_Output || obj == kObjectID_Stream_Input;
+    return obj == kObjectID_Stream_Output || obj == kObjectID_Stream_Input || obj == kObjectID_Stream_AM_Input;
+}
+
+static bool is_device(AudioObjectID obj)
+{
+    return obj == kObjectID_Device || obj == kObjectID_Device_AM;
 }
 
 static Boolean SM_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID obj, pid_t pid, const AudioObjectPropertyAddress *a)
@@ -1739,7 +1852,7 @@ static Boolean SM_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID
     (void)pid;
     if (inDriver != gDriverRef || !a) return false;
     if (obj == kObjectID_PlugIn) return plugin_has(a);
-    if (obj == kObjectID_Device) return device_has(a);
+    if (is_device(obj)) return device_has(obj, a);
     if (is_stream(obj)) return stream_has(a);
     return false;
 }
@@ -1753,7 +1866,11 @@ static OSStatus SM_IsPropertySettable(AudioServerPlugInDriverRef inDriver, Audio
         *out = false;
         return plugin_has(a) ? 0 : kAudioHardwareUnknownPropertyError;
     }
-    if (obj == kObjectID_Device) return device_settable(a, out);
+    if (is_device(obj)) return device_settable(obj, a, out);
+    if (obj == kObjectID_Stream_AM_Input) {      /* follows the main device */
+        *out = false;
+        return stream_has(a) ? 0 : kAudioHardwareUnknownPropertyError;
+    }
     if (is_stream(obj)) return stream_settable(a, out);
     return kAudioHardwareBadObjectError;
 }
@@ -1765,8 +1882,8 @@ static OSStatus SM_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, Audi
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     if (!a || !out) return kAudioHardwareIllegalOperationError;
     if (obj == kObjectID_PlugIn) return plugin_size(a, out);
-    if (obj == kObjectID_Device) return device_size(a, out);
-    if (is_stream(obj)) return stream_size(obj == kObjectID_Stream_Input, a, out);
+    if (is_device(obj)) return device_size(obj, a, out);
+    if (is_stream(obj)) return stream_size(obj == kObjectID_Stream_Input || obj == kObjectID_Stream_AM_Input, a, out);
     return kAudioHardwareBadObjectError;
 }
 
@@ -1777,8 +1894,11 @@ static OSStatus SM_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObj
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     if (!a || !outDataSize || !outData) return kAudioHardwareIllegalOperationError;
     if (obj == kObjectID_PlugIn) return plugin_get(a, qSize, qData, inDataSize, outDataSize, outData);
-    if (obj == kObjectID_Device) return device_get(a, inDataSize, outDataSize, outData);
-    if (is_stream(obj)) return stream_get(obj == kObjectID_Stream_Input, a, inDataSize, outDataSize, outData);
+    if (is_device(obj)) return device_get(obj, a, inDataSize, outDataSize, outData);
+    if (is_stream(obj)) {
+        bool input = obj == kObjectID_Stream_Input || obj == kObjectID_Stream_AM_Input;
+        return stream_get(input, obj == kObjectID_Stream_AM_Input ? kObjectID_Device_AM : kObjectID_Device, a, inDataSize, outDataSize, outData);
+    }
     return kAudioHardwareBadObjectError;
 }
 
@@ -1789,7 +1909,8 @@ static OSStatus SM_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObj
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
     if (!a || !inData) return kAudioHardwareIllegalOperationError;
     if (obj == kObjectID_PlugIn) return kAudioHardwareUnknownPropertyError;
-    if (obj == kObjectID_Device) return device_set(a, inDataSize, inData);
+    if (is_device(obj)) return device_set(obj, a, inDataSize, inData);
+    if (obj == kObjectID_Stream_AM_Input) return kAudioDeviceUnsupportedFormatError;
     if (is_stream(obj)) return stream_set(obj == kObjectID_Stream_Input, a, inDataSize, inData);
     return kAudioHardwareBadObjectError;
 }
@@ -1799,7 +1920,20 @@ static OSStatus SM_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObj
 static OSStatus SM_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt32 client)
 {
     (void)client;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) {
+        pthread_mutex_lock(&gIOMutex);
+        if (gIOCount_AM++ == 0) {
+            gNumTimeStamps_AM = 0;
+            gAnchorHost_AM = mach_absolute_time();
+            gClockSeed_AM++;
+            gLoopStarted = false;          /* IO is not running: this thread owns the reader state now */
+            gLoopR = atomic_load_explicit(&gLoopW, memory_order_acquire);
+            gLoopSeenFlush = atomic_load(&gLoopFlush);
+        }
+        pthread_mutex_unlock(&gIOMutex);
+        return 0;
+    }
     pthread_mutex_lock(&gIOMutex);
     if (gIOCount == UINT32_MAX) {
         pthread_mutex_unlock(&gIOMutex);
@@ -1819,7 +1953,14 @@ static OSStatus SM_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID in
 static OSStatus SM_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt32 client)
 {
     (void)client;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) {
+        pthread_mutex_lock(&gIOMutex);
+        OSStatus st = gIOCount_AM == 0 ? kAudioHardwareIllegalOperationError : 0;
+        if (!st) gIOCount_AM--;
+        pthread_mutex_unlock(&gIOMutex);
+        return st;
+    }
     pthread_mutex_lock(&gIOMutex);
     if (gIOCount == 0) {
         pthread_mutex_unlock(&gIOMutex);
@@ -1838,7 +1979,19 @@ static OSStatus SM_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioOb
                                     Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed)
 {
     (void)client;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) {
+        pthread_mutex_lock(&gIOMutex);
+        UInt64 nowAM = mach_absolute_time();
+        Float64 ticksAM = gHostTicksPerFrame * kZeroTimeStampPeriod;
+        UInt64 nextAM = gAnchorHost_AM + (UInt64)((Float64)(gNumTimeStamps_AM + 1) * ticksAM);
+        if (nextAM <= nowAM) gNumTimeStamps_AM++;
+        *outSampleTime = (Float64)(gNumTimeStamps_AM * kZeroTimeStampPeriod);
+        *outHostTime = gAnchorHost_AM + (UInt64)((Float64)gNumTimeStamps_AM * ticksAM);
+        *outSeed = gClockSeed_AM;
+        pthread_mutex_unlock(&gIOMutex);
+        return 0;
+    }
     pthread_mutex_lock(&gIOMutex);
     UInt64 now = mach_absolute_time();
     Float64 ticksPerPeriod = gHostTicksPerFrame * kZeroTimeStampPeriod;
@@ -1855,7 +2008,12 @@ static OSStatus SM_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioO
                                      Boolean *outWillDo, Boolean *outInPlace)
 {
     (void)client;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
+    if (inDevice == kObjectID_Device_AM) {
+        if (outWillDo) *outWillDo = op == kAudioServerPlugInIOOperationReadInput;
+        if (outInPlace) *outInPlace = true;
+        return 0;
+    }
     bool will = op == kAudioServerPlugInIOOperationWriteMix || op == kAudioServerPlugInIOOperationReadInput ||
                 op == kAudioServerPlugInIOOperationProcessOutput;
     if (outWillDo) *outWillDo = will;
@@ -1867,7 +2025,7 @@ static OSStatus SM_BeginIOOperation(AudioServerPlugInDriverRef inDriver, AudioOb
                                     UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle)
 {
     (void)client; (void)op; (void)frames; (void)cycle;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     return 0;
 }
 
@@ -1975,6 +2133,46 @@ static void process_output(UInt32 client, Float32 *buf, UInt32 frames, Float64 s
     atomic_fetch_add_explicit(&gStatOthersFrames, frames, memory_order_relaxed);
 }
 
+/* SMlb, AM device IO thread: Float32 frames from the ring behind the sender. It waits for a cushion before
+ * it starts, plays zeros for what is missing (and waits for the cushion again), and skips ahead if it
+ * has fallen far behind or the sender lapped it. */
+static void read_loopback(Float32 *buf, UInt32 frames)
+{
+    uint64_t w = atomic_load_explicit(&gLoopW, memory_order_acquire);
+    unsigned flush = atomic_load_explicit(&gLoopFlush, memory_order_relaxed);
+    if (flush != gLoopSeenFlush) {          /* a new wire format: what is queued belongs to the old one */
+        gLoopSeenFlush = flush;
+        gLoopR = w;
+        gLoopStarted = false;
+    }
+    uint64_t cushion = (uint64_t)gRate * kLoopCushionMs / 1000u;
+    if (cushion < (uint64_t)frames * 2) cushion = (uint64_t)frames * 2;
+    uint64_t maxLag = (uint64_t)gRate / 2;                       /* half a second */
+    if (maxLag > kLoopFrames - 8192) maxLag = kLoopFrames - 8192;
+    if (w - gLoopR > maxLag) {
+        gLoopR = w - cushion;
+        atomic_fetch_add_explicit(&gStatLoopSkips, 1, memory_order_relaxed);
+    }
+    if (!gLoopStarted && w - gLoopR >= cushion) gLoopStarted = true;
+    UInt32 n = 0;
+    if (gLoopStarted) {
+        uint64_t avail = w - gLoopR;
+        n = avail < frames ? (UInt32)avail : frames;
+        for (UInt32 i = 0; i < n; i++) {
+            size_t k = (size_t)((gLoopR + i) % kLoopFrames) * 2;
+            buf[i * 2] = gLoopBuf[k];
+            buf[i * 2 + 1] = gLoopBuf[k + 1];
+        }
+        gLoopR += n;
+        atomic_fetch_add_explicit(&gStatLoopFrames, n, memory_order_relaxed);
+        if (n < frames) {
+            gLoopStarted = false;
+            atomic_fetch_add_explicit(&gStatLoopUnderruns, 1, memory_order_relaxed);
+        }
+    }
+    if (n < frames) memset(buf + (size_t)n * 2, 0, (size_t)(frames - n) * 2 * sizeof(Float32));
+}
+
 /* The others loopback, read back on the input stream and cleared as it is read. */
 static void read_input(Float32 *buf, UInt32 frames, Float64 sampleTime)
 {
@@ -1995,8 +2193,12 @@ static OSStatus SM_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjec
                                  UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *main, void *secondary)
 {
     (void)stream; (void)secondary;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     if (!main || !cycle) return 0;
+    if (inDevice == kObjectID_Device_AM) {
+        if (op == kAudioServerPlugInIOOperationReadInput) read_loopback(main, frames);
+        return 0;
+    }
     switch (op) {
     case kAudioServerPlugInIOOperationProcessOutput:
         process_output(client, main, frames, cycle->mOutputTime.mSampleTime);
@@ -2029,6 +2231,6 @@ static OSStatus SM_EndIOOperation(AudioServerPlugInDriverRef inDriver, AudioObje
                                   UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle)
 {
     (void)client; (void)op; (void)frames; (void)cycle;
-    if (inDriver != gDriverRef || inDevice != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     return 0;
 }

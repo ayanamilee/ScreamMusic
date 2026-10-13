@@ -159,6 +159,34 @@ static inline void scream_put_le(uint8_t *dst, int32_t v, unsigned bytes)
         dst[i] = (uint8_t)(u >> (8 * i));
 }
 
+/* Little-endian signed integer of 2..4 bytes, sign-extended. */
+static inline int32_t scream_get_le(const uint8_t *src, unsigned bytes)
+{
+    uint32_t u = 0;
+    for (unsigned i = 0; i < bytes; i++)
+        u |= (uint32_t)src[i] << (8 * i);
+    if (bytes < 4 && (u & (1u << (8 * bytes - 1))))
+        u |= ~0u << (8 * bytes);
+    return (int32_t)u;
+}
+
+/*
+ * The inverse of scream_pack_float: wire integer -> Float32, v / 2^(N-1). Exact for every 16- and
+ * 24-bit sample, and for the original dialect's 24-bit audio left-aligned in S32 (24 significant
+ * bits fit Float32's mantissa); a full 32-bit integer source would not be exact (never mixed in
+ * Float32 on this path).
+ */
+static inline void scream_unpack_float(float *dst, const uint8_t *src, size_t samples, scream_wire_t w)
+{
+    unsigned bits = scream_sample_size_byte(w);
+    unsigned bps = scream_bytes_per_sample(w);
+    double inv = 1.0 / (double)(1ull << (bits - 1));
+    for (size_t i = 0; i < samples; i++) {
+        dst[i] = (float)((double)scream_get_le(src, bps) * inv);
+        src += bps;
+    }
+}
+
 /*
  * Exact float -> N-bit integer: round(x * 2^(N-1)), clamped, no dither.
  * A 16- or 24-bit sample carried in Float32 comes back unchanged. Scaling by
