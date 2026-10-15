@@ -39,8 +39,8 @@ public struct StartChoice: Equatable {
 }
 
 /// nil: nothing is known yet; hold and wait for the track's own decoder line.
-public func chooseStart(preRoll: WireFormat?, scriptRate: Double?, learned: LearnedFormat?, followDepth: Bool) -> StartChoice? {
-    let remembered = learned.flatMap { $0.lossy ? nil : WireFormat(rate: $0.rate, bits: followDepth ? $0.bits : 24) }
+public func chooseStart(preRoll: WireFormat?, scriptRate: Double?, learned: LearnedFormat?) -> StartChoice? {
+    let remembered = learned.flatMap { $0.lossy ? nil : WireFormat(rate: $0.rate, bits: $0.bits) }
     if let preRoll {
         let target = WireFormat.best(preRoll, scriptRate.map { WireFormat(rate: $0, bits: preRoll.bits) })!
         return StartChoice(target: target, source: .preRoll, manualStart: false,

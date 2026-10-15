@@ -240,8 +240,6 @@ struct PanelView: View {
                 }
                 Text("Mute").tag("mute")
             }
-            Toggle("Follow each track's bit depth (16 / 24-bit)", isOn: $music.followDepth)
-                .font(.callout)
         }
     }
 

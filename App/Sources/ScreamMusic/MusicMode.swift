@@ -21,9 +21,6 @@ final class MusicMode: ObservableObject {
     @Published var othersRoute: String {
         didSet { UserDefaults.standard.set(othersRoute, forKey: Keys.othersRoute); if enabled { applyOthers() } }
     }
-    @Published var followDepth: Bool {
-        didSet { UserDefaults.standard.set(followDepth, forKey: Keys.followDepth); if enabled { restartFollower() } }
-    }
     @Published private(set) var enabled = false
     @Published private(set) var follower = FollowerState()
     @Published private(set) var othersStatus: String?
@@ -34,7 +31,6 @@ final class MusicMode: ObservableObject {
     private enum Keys {
         static let enabled = "musicMode"
         static let othersRoute = "othersRoute"
-        static let followDepth = "followDepth"
         static let previousOutput = "previousOutputUID"
         static let previousAlert = "previousAlertUID"
         static let ownsOutput = "ownsOutput"
@@ -53,7 +49,6 @@ final class MusicMode: ObservableObject {
     init() {
         let d = UserDefaults.standard
         othersRoute = d.string(forKey: Keys.othersRoute) ?? "previous"
-        followDepth = d.object(forKey: Keys.followDepth) as? Bool ?? true
         previousOutputName = d.string(forKey: Keys.previousOutput).flatMap { SystemAudio.device(uid: $0) }.map { SystemAudio.name($0) } ?? ""
     }
 
@@ -229,7 +224,7 @@ final class MusicMode: ObservableObject {
     private func restartFollower() {
         rateFollower?.stop()
         guard enabled, let dev = device else { return }
-        let f = RateFollower(device: dev, followDepth: followDepth)
+        let f = RateFollower(device: dev)
         f.onChange = { [weak self] s in
             self?.follower = s
             self?.checkMusicSettings()
