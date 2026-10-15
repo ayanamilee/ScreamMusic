@@ -224,6 +224,7 @@ extension ScreamDevice {
     static let hold: AudioObjectPropertySelector = 0x534D_6864        // 'SMhd'
     static let holdReached: AudioObjectPropertySelector = 0x534D_6872 // 'SMhr'
     static let owner: AudioObjectPropertySelector = 0x534D_6163       // 'SMac'
+    static let listed: AudioObjectPropertySelector = 0x534D_7368      // 'SMsh'
 
     enum Hold: Int { case run = 0, gate = 1, boundary = 2, drop = 3 }
 

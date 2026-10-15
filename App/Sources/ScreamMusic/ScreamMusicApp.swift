@@ -93,8 +93,6 @@ struct PanelView: View {
     @ObservedObject var installer: DriverInstaller
     @ObservedObject var music: MusicMode
     @State private var advanced = false
-    @State private var confirmUninstall = false
-    @State private var uninstallNote: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -125,17 +123,21 @@ struct PanelView: View {
         }
         .padding(14)
         .frame(width: 380)
-        .alert("Uninstall ScreamMusic?", isPresented: $confirmUninstall) {
-            Button("Uninstall", role: .destructive) { uninstall() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Turns off Apple Music mode and restores the outputs, removes the driver (administrator password; audio restarts for a moment), deletes this app's settings and logs, then deletes and quits the app.")
-        }
-        .alert("ScreamMusic", isPresented: Binding(get: { uninstallNote != nil }, set: { if !$0 { uninstallNote = nil } })) {
-            Button("OK") { NSApplication.shared.terminate(nil) }
-        } message: {
-            Text(uninstallNote ?? "")
-        }
+    }
+
+    /// SwiftUI `.alert` in this LSUIElement app draws the buttons but does not take clicks (seen on
+    /// macOS 27). AppKit's modal alert does.
+    private func confirmUninstall() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Uninstall ScreamMusic?"
+        alert.informativeText = "Turns off Apple Music mode and restores the outputs, removes the driver (administrator password; audio restarts for a moment), deletes this app's settings and logs, then deletes and quits the app."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Uninstall")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        uninstall()
     }
 
     private func uninstall() {
@@ -143,7 +145,12 @@ struct PanelView: View {
             if deleted {
                 NSApplication.shared.terminate(nil)
             } else {
-                uninstallNote = "The driver, settings and logs are gone. The app is still at:\n\(Bundle.main.bundleURL.path)\n\nMove it to the Trash yourself."
+                let note = NSAlert()
+                note.messageText = "ScreamMusic"
+                note.informativeText = "The driver, settings and logs are gone. The app is still at:\n\(Bundle.main.bundleURL.path)\n\nMove it to the Trash yourself."
+                note.addButton(withTitle: "OK")
+                note.runModal()
+                NSApplication.shared.terminate(nil)
             }
         }
     }
@@ -314,7 +321,7 @@ struct PanelView: View {
                     Text("Driver \(v)").foregroundStyle(.secondary)
                     Spacer()
                     Button("Remove Driver…") { installer.remove() }
-                    Button("Uninstall…") { confirmUninstall = true }
+                    Button("Uninstall…") { confirmUninstall() }
                 case .outdated(let i, let b):
                     Text("Driver \(i) (this app carries \(b))").foregroundStyle(.secondary)
                     Spacer()

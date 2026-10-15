@@ -62,6 +62,7 @@ enum {
     kSM_Hold        = 'SMhd',   /* CFNumber, hold point: 0 run, 1 gate, 2 boundary, 3 drop */
     kSM_HoldReached = 'SMhr',   /* CFNumber, read only: 1 = holding */
     kSM_Owner       = 'SMac',   /* CFNumber, the controlling app's pid (cleanup when it dies) */
+    kSM_Listed      = 'SMsh',   /* CFNumber 1/0: in the output list only while the app is running */
     kSM_Mirror      = 'SMmr',   /* CFDictionary {ip, port}: also send every packet there (diagnostics); {} = off */
     kSM_LeadIn      = 'SMli',   /* CFNumber, milliseconds of silence before a new wire format (relock) */
     kSM_LeadOnce    = 'SMlo',   /* CFNumber, ms of lead-in for the next format change only (0 = none); expires */
@@ -177,6 +178,7 @@ static _Atomic uint64_t gLeadOnceUntil;          /* host time after which it no 
 static _Atomic unsigned gWantBits;         /* SMbd: 0 = auto */
 static _Atomic int gMusicPID;              /* SMmx */
 static _Atomic int gOwnerPID;              /* SMac */
+static _Atomic int gListed;                /* SMsh: 0 hides the device */
 static _Atomic int gHoldMode;              /* SMhd */
 static _Atomic unsigned gHoldSerial;       /* bumped on every SMhd write */
 static _Atomic bool gHoldReached;          /* SMhr */
@@ -767,6 +769,8 @@ static void check_owner(uint64_t *lastCheck)
         atomic_store(&gMusicPID, 0);
         atomic_store(&gDelayMs, kDefaultDelayMs);
         set_hold(kHold_Run);
+        if (atomic_exchange(&gListed, 0) != 0)
+            notify(kObjectID_Device, kAudioDevicePropertyIsHidden);
     }
 }
 
@@ -1287,7 +1291,7 @@ static OSStatus plugin_get(const AudioObjectPropertyAddress *a, UInt32 qSize, co
 #define CUSTOM(sel) {sel, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone}
 static const AudioServerPlugInCustomPropertyInfo kCustomProps[] = {
     CUSTOM(kSM_Destination), CUSTOM(kSM_Status), CUSTOM(kSM_EndOfTrack), CUSTOM(kSM_SendDelay),
-    CUSTOM(kSM_WireBits), CUSTOM(kSM_MusicPID), CUSTOM(kSM_Hold), CUSTOM(kSM_HoldReached), CUSTOM(kSM_Owner),
+    CUSTOM(kSM_WireBits), CUSTOM(kSM_MusicPID), CUSTOM(kSM_Hold), CUSTOM(kSM_HoldReached), CUSTOM(kSM_Owner), CUSTOM(kSM_Listed),
     CUSTOM(kSM_Mirror), CUSTOM(kSM_LeadIn), CUSTOM(kSM_LeadOnce),
 };
 #define kNumCustomProps (sizeof kCustomProps / sizeof kCustomProps[0])
@@ -1354,6 +1358,7 @@ static OSStatus device_settable(const AudioObjectPropertyAddress *a, Boolean *ou
     case kSM_MusicPID:
     case kSM_Hold:
     case kSM_Owner:
+    case kSM_Listed:
     case kSM_Mirror:
         *out = true;
         return 0;
@@ -1444,7 +1449,7 @@ static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
         return 0;
     }
     case kAudioDevicePropertySafetyOffset: WRITE_VALUE(UInt32, 0); return 0;
-    case kAudioDevicePropertyIsHidden: WRITE_VALUE(UInt32, 0); return 0;
+    case kAudioDevicePropertyIsHidden: WRITE_VALUE(UInt32, atomic_load(&gListed) ? 0 : 1); return 0;
     case kAudioDevicePropertyZeroTimeStampPeriod: WRITE_VALUE(UInt32, kZeroTimeStampPeriod); return 0;
     case kAudioDevicePropertyNominalSampleRate: {
         pthread_mutex_lock(&gStateMutex);
@@ -1486,6 +1491,7 @@ static OSStatus device_get(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
     case kSM_Hold:        WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gHoldMode))); return 0;
     case kSM_HoldReached: WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gHoldReached) ? 1 : 0)); return 0;
     case kSM_Owner:       WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gOwnerPID))); return 0;
+    case kSM_Listed:      WRITE_VALUE(CFPropertyListRef, number_i(atomic_load(&gListed))); return 0;
     case kSM_Mirror: {
         pthread_mutex_lock(&gDestMutex);
         CFStringRef ip = CFStringCreateWithCString(NULL, gMirrorIP, kCFStringEncodingUTF8);
@@ -1600,6 +1606,11 @@ static OSStatus device_set(const AudioObjectPropertyAddress *a, UInt32 inDataSiz
         return 0;
     case kSM_Owner:
         atomic_store(&gOwnerPID, v);
+        return 0;
+    case kSM_Listed:
+        if (v != 0 && v != 1) return kAudioHardwareIllegalOperationError;
+        if (atomic_exchange(&gListed, v) != v)
+            notify(kObjectID_Device, kAudioDevicePropertyIsHidden);
         return 0;
     }
     return kAudioHardwareUnknownPropertyError;

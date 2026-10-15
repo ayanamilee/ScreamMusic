@@ -61,6 +61,7 @@ final class MusicMode: ObservableObject {
 
     /// At launch: undo what a crashed run left behind, then resume the mode if it was on.
     func launch() {
+        showInList()
         let d = UserDefaults.standard
         if d.bool(forKey: Keys.ownsOutput) && !wantsEnabled {
             elog("music mode: the last run did not clean up; restoring the outputs")
@@ -78,11 +79,27 @@ final class MusicMode: ObservableObject {
     /// App quit: give the outputs back, but keep the mode on for the next launch.
     func quit() {
         if enabled { tearDown() }
+        hideFromList()
+    }
+
+    /// The device stays loaded, but only appears in the output list while this app is running.
+    func showInList() {
+        guard let dev = ScreamDevice.find() else { return }
+        ScreamDevice.setInt(dev, ScreamDevice.listed, 1)
+    }
+
+    private func hideFromList() {
+        guard let dev = ScreamDevice.find() else { return }
+        if SystemAudio.defaultOutput() == dev, let back = SystemAudio.builtInOutput() {
+            SystemAudio.setDefaultOutput(back)
+        }
+        ScreamDevice.setInt(dev, ScreamDevice.listed, 0)
     }
 
     /// The driver was reloaded (coreaudiod restarted, driver updated): the device has a new object ID
     /// and the driver starts with Apple Music mode off. Called every second by AppModel.
     func checkDriver() {
+        showInList()
         guard enabled else {
             // the mode is wanted but the driver wasn't there: start when it appears
             if wantsEnabled, problem != nil, ScreamDevice.find() != nil { enable() }
