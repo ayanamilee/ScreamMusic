@@ -10,7 +10,7 @@ Requires macOS 26 or later. Protocol-compatible with [screamalsa](https://github
 
 The zip in [Releases](https://github.com/ayanamilee/ScreamMusic/releases). Ad-hoc signed, not notarized: unzip, right-click the app, Open.
 
-**Use 0.4.7.** 0.5.0 and 0.5.1 have a known problem: the device clock runs slow, so the receiver underruns and the sound is garbled. Those releases are kept for the record; do not install them.
+**Use 0.4.9.** 0.5.0 and 0.5.1 have a known problem: the device clock runs slow, so the receiver underruns and the sound is garbled. Those releases are kept for the record; do not install them.
 
 ## Receiver
 
