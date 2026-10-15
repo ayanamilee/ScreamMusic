@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md)
 
-A macOS menu-bar app with a small audio driver. It adds a sound card called **ScreamMusic** to the system and keeps Apple Music bit-perfect at each track's own sample rate and bit depth. The sound can go to a Scream receiver on the network (UDP), or to a local input device that apps like HQPlayer can read.
+A macOS menu-bar app with a small audio driver. It adds a sound card called **ScreamMusic** to the system and keeps Apple Music bit-perfect at each track's own sample rate and bit depth. What is played into it is sent unchanged over the Scream protocol (UDP).
 
 Requires macOS 26 or later. Protocol-compatible with [screamalsa](https://github.com/ayanamilee/screamalsa). License: GPL-3.0.
 
@@ -10,13 +10,11 @@ Requires macOS 26 or later. Protocol-compatible with [screamalsa](https://github
 
 The zip in [Releases](https://github.com/ayanamilee/ScreamMusic/releases). Ad-hoc signed, not notarized: unzip, right-click the app, Open.
 
-## Two ways to use it
+**Use 0.4.7.** 0.5.0 and 0.5.1 have a known problem: the device clock runs slow, so the receiver underruns and the sound is garbled. Those releases are kept for the record; do not install them.
 
-The Receiver dropdown in the panel picks one. They are exclusive.
+## Receiver
 
-### Scream (network)
-
-Apple Music goes over UDP to a Scream receiver. Fill in its IP and port, Apply, and pick the header the receiver expects:
+Fill in the IP and port in the app, Apply, and pick the header the receiver expects:
 
 | Receiver | Header |
 |---|---|
@@ -27,27 +25,23 @@ s2d and original scream listen on **4010** by default. This app sends to **4011*
 
 Original sends 32-bit PCM only. Extended sends 16 / 24 / 32-bit per track.
 
-### Loopback (ScreamMusic AM)
+## Use
 
-Apple Music does not go to the network. It appears in a second device, **ScreamMusic AM**, an input-only stereo device whose sample rate follows the track. Software with an input picker (HQPlayer, for example) selects it directly.
-
-The track-change hold, the drop of a wrong-rate start and the relock silence all still apply. The device carries Float32, which holds 16- and 24-bit samples exactly (tested bit for bit), so sound quality is unchanged. macOS asks that software for Microphone access.
-
-The original **ScreamMusic** device is unchanged: it is the output, and its input carries other apps' sound.
-
-Routing apps that play for Music (SoundSource, Loopback and the like) mean Music no longer reaches ScreamMusic directly, so ScreamMusic AM gets nothing from it. Keep Music out of such apps when you use Loopback.
-
-## Apple Music mode
-
-Turning it on:
-
-1. The system default output becomes ScreamMusic (the previous output is remembered and restored when the mode goes off).
-2. The device follows each track's sample rate and bit depth. When the rate changes, the track is held at the gap between tracks, the device is switched, and the track is rewound and replayed — the first fraction of a second at the old rate never reaches the receiver.
-3. Other apps play on the output you choose (the one from before the mode, built-in, or a specific device), or are muted.
+1. Open the app and click **Install Driver…** (administrator password; system audio stops for a moment).
+2. Fill in the receiver and click Apply.
+3. **Apple Music**: turn on Apple Music mode. Allow control of Music; if other apps should play on another output, also allow the Microphone.
 
 Set the volume on the amplifier or the receiver. The sound card has no volume — it would no longer be bit-perfect.
 
-Removing the driver: **Remove Driver…**. Removing everything (outputs restored, driver removed, settings and logs deleted, the app itself deleted): **Uninstall…**.
+Turning the mode off, or quitting, restores the previous default output. **Remove Driver…** removes only the sound card. **Uninstall…** restores the outputs, removes the driver, deletes settings and logs, and deletes the app.
+
+## Apple Music mode
+
+When it is on:
+
+1. The system default output becomes ScreamMusic (the previous output is remembered and restored when the mode goes off). That is how Apple Music's sound is captured.
+2. The device follows each track's sample rate and bit depth. When the rate changes, the track is held at the gap between tracks, the device is switched, and the track is rewound and replayed — the first fraction of a second at the old rate never reaches the receiver.
+3. Other apps play on the output you choose (the one from before the mode, built-in, or a specific device), or are muted.
 
 ## Notes
 

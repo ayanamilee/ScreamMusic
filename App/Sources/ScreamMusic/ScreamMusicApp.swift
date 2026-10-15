@@ -161,13 +161,8 @@ struct PanelView: View {
         let s = model.status
         return VStack(alignment: .leading, spacing: 4) {
             if s.running {
-                if s.loopback == true {
-                    Text("Loopback \(rateText(Double(s.rate))) / \(s.wireBits)-bit on ScreamMusic AM")
-                        .fontWeight(.medium)
-                } else {
-                    Text("Sending \(rateText(Double(s.rate))) / \(s.wireBits)-bit to \(model.destination.ip):\(String(model.destination.port))")
-                        .fontWeight(.medium)
-                }
+                Text("Sending \(rateText(Double(s.rate))) / \(s.wireBits)-bit to \(model.destination.ip):\(String(model.destination.port))")
+                    .fontWeight(.medium)
             } else {
                 Text("Idle").fontWeight(.medium)
             }
@@ -246,34 +241,17 @@ struct PanelView: View {
     private var destinationSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Receiver").fontWeight(.medium)
-            // Only a driver that has the ScreamMusic AM input (0.5.0+) reports it.
-            let loopbackOn = model.status.loopback == true
-            if model.status.loopback != nil {
-                Picker("", selection: Binding(get: { loopbackOn }, set: { model.setLoopback($0) })) {
-                    Text("Scream receiver (network)").tag(false)
-                    Text("Loopback: ScreamMusic AM").tag(true)
-                }
-                .labelsHidden()
-                if loopbackOn {
-                    Text("Choose \"ScreamMusic AM\" as the input in software like HQPlayer.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            HStack {
+                TextField("IP address", text: $model.edit.ip)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Port", value: $model.edit.port, format: .number.grouping(.never))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 70)
             }
-            Group {
-                HStack {
-                    TextField("IP address", text: $model.edit.ip)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Port", value: $model.edit.port, format: .number.grouping(.never))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 70)
-                }
-                Picker("Header", selection: $model.edit.header) {
-                    Text("Extended (6-byte)").tag("extended")
-                    Text("Original (5-byte, S32 only)").tag("original")
-                }
+            Picker("Header", selection: $model.edit.header) {
+                Text("Extended (6-byte)").tag("extended")
+                Text("Original (5-byte, S32 only)").tag("original")
             }
-            .disabled(loopbackOn)
             HStack {
                 if let e = model.applyError {
                     Text(e).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)

@@ -121,13 +121,6 @@ final class AppModel: ObservableObject {
         if st == noErr { edit = destination }
     }
 
-    /// Apple Music to the network (Scream receiver) or to the ScreamMusic AM input (Loopback).
-    func setLoopback(_ on: Bool) {
-        guard let d = device else { return }
-        ScreamDevice.setInt(d, ScreamDevice.loopback, on ? 1 : 0)
-        poll()
-    }
-
     func setLeadIn(_ ms: Int) {
         guard let d = device else { return }
         ScreamDevice.setInt(d, ScreamDevice.leadIn, ms)

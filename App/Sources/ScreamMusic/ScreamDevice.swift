@@ -20,7 +20,6 @@ enum ScreamDevice {
     static let sendDelay: AudioObjectPropertySelector = 0x534D_646C   // 'SMdl'
     static let leadIn: AudioObjectPropertySelector = 0x534D_6C69      // 'SMli'
     static let leadOnce: AudioObjectPropertySelector = 0x534D_6C6F    // 'SMlo'
-    static let loopback: AudioObjectPropertySelector = 0x534D_6C62    // 'SMlb'
     static let wireBits: AudioObjectPropertySelector = 0x534D_6264    // 'SMbd'
 
     static let rates: [Double] = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
@@ -122,10 +121,6 @@ struct DriverStatus {
     var holdReached = false
     /// Silence before a new wire format, ms; nil: the driver predates it (0.4.5).
     var leadInMs: Int?
-    /// Apple Music goes to the ScreamMusic AM input instead of the network; nil: the driver predates it (0.5.0).
-    var loopback: Bool?
-    var loopFrames = 0
-    var loopUnderruns = 0
     var clients: [Client] = []
 
     init() {}
@@ -150,9 +145,6 @@ struct DriverStatus {
         holdMode = d["holdMode"] as? Int ?? 0
         holdReached = d["holdReached"] as? Bool ?? false
         leadInMs = d["leadInMs"] as? Int
-        loopback = (d["loopback"] as? Int).map { $0 != 0 }
-        loopFrames = d["loopFrames"] as? Int ?? 0
-        loopUnderruns = d["loopUnderruns"] as? Int ?? 0
         clients = (d["clients"] as? [[String: Any]] ?? []).map { Client(pid: $0["pid"] as? Int ?? 0, bundleID: $0["bundleID"] as? String ?? "") }
     }
 }

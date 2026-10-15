@@ -19,8 +19,6 @@
 #define PORT 14012
 #define kDevice 2
 #define kStream 3
-#define kDeviceAM 5
-#define kStreamAM 6
 
 static AudioServerPlugInDriverRef gDrv;
 static int failures;
@@ -578,142 +576,6 @@ static void case_lead_in(void)
     free(b);
 }
 
-/* ---- ScreamMusic AM / Loopback (SMlb) ------------------------------------------ */
-
-static UInt32 object_list(AudioObjectID obj, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope, AudioObjectID *out, UInt32 max)
-{
-    AudioObjectPropertyAddress a = {sel, scope, kAudioObjectPropertyElementMain};
-    UInt32 size = 0;
-    if ((*gDrv)->GetPropertyDataSize(gDrv, obj, 0, &a, 0, NULL, &size) != 0) return 0;
-    if (size > max * sizeof(AudioObjectID)) size = max * sizeof(AudioObjectID);
-    UInt32 got = size;
-    if ((*gDrv)->GetPropertyData(gDrv, obj, 0, &a, 0, NULL, size, &got, out) != 0) return 0;
-    return got / sizeof(AudioObjectID);
-}
-
-static void case_loopback(void)
-{
-    /* the plug-in lists both devices; each owns the right streams; the AM name/UID are its own */
-    AudioObjectID ids[4] = {0};
-    UInt32 n = object_list(kAudioObjectPlugInObject, kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, ids, 4);
-    CHECK(n == 2 && ids[0] == kDevice && ids[1] == kDeviceAM, "plug-in device list: %u devices (%u, %u)", n, ids[0], ids[1]);
-    n = object_list(kDeviceAM, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput, ids, 4);
-    CHECK(n == 1 && ids[0] == kStreamAM, "AM input streams: %u", n);
-    n = object_list(kDeviceAM, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, ids, 4);
-    CHECK(n == 0, "AM has %u output streams", n);
-    n = object_list(kDevice, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeGlobal, ids, 4);
-    CHECK(n == 2, "main device streams: %u", n);
-    {
-        AudioObjectPropertyAddress a = {kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-        CFStringRef uid = NULL;
-        UInt32 size = sizeof uid;
-        CHECK((*gDrv)->GetPropertyData(gDrv, kDeviceAM, 0, &a, 0, NULL, size, &size, &uid) == 0 && uid &&
-              CFStringCompare(uid, CFSTR("ScreamMusic_AM_UID"), 0) == kCFCompareEqualTo, "AM UID");
-        AudioObjectPropertyAddress nm = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-        CFStringRef name = NULL;
-        size = sizeof name;
-        CHECK((*gDrv)->GetPropertyData(gDrv, kDeviceAM, 0, &nm, 0, NULL, size, &size, &name) == 0 && name &&
-              CFStringCompare(name, CFSTR("ScreamMusic AM"), 0) == kCFCompareEqualTo, "AM name");
-        Float64 rate = 0;
-        AudioObjectPropertyAddress ra = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-        Boolean settable = true;
-        size = sizeof rate;
-        CHECK((*gDrv)->GetPropertyData(gDrv, kDeviceAM, 0, &ra, 0, NULL, size, &size, &rate) == 0 && rate > 0, "AM rate");
-        CHECK((*gDrv)->IsPropertySettable(gDrv, kDeviceAM, 0, &ra, &settable) == 0 && !settable, "AM rate must not be settable");
-    }
-
-    /* Float32 24-bit audio through the main device, read back bit-exact on the AM input, nothing on the network */
-    const Float64 rate = 48000;
-    size_t frames = 24000;
-    float *src = malloc(frames * 2 * sizeof(float));
-    for (size_t i = 0; i < frames * 2; i++) {
-        int32_t v = (int32_t)(rnd() << 8) >> 8;
-        src[i] = (float)((double)v / 8388608.0);
-    }
-    src[0] = 1.0f / 8388608.0f;              /* the first sample is not zero: find the start by it */
-    src[1] = -1.0f / 8388608.0f;
-    reset_rx(SCREAM_DIALECT_EXTENDED);
-    set_destination("extended");
-    set_int('SMli', 0);
-    set_int('SMbd', 24);
-    set_int('SMdl', 20);
-    set_format(rate, kFloatFlags, 32);
-    long long packetsBefore = status_int(CFSTR("packets"));
-    set_int('SMlb', 1);
-    long long loopOn = status_int(CFSTR("loopback"));
-    CHECK(loopOn == 1, "status loopback %lld", loopOn);
-
-    (*gDrv)->StartIO(gDrv, kDevice, 1);
-    (*gDrv)->StartIO(gDrv, kDeviceAM, 2);
-    size_t cap = frames + 24000;
-    float *got = calloc(cap * 2, sizeof(float));
-    size_t gotN = 0, written = 0;
-    for (int step = 0; step < 400 && gotN + 128 <= cap; step++) {
-        if (step % 4 == 0 && written < frames) {
-            UInt32 w = (UInt32)(frames - written < 512 ? frames - written : 512);
-            float buf[512 * 2];
-            memcpy(buf, src + written * 2, w * 8);
-            AudioServerPlugInIOCycleInfo info = {0};
-            (*gDrv)->DoIOOperation(gDrv, kDevice, kStream, 1, kAudioServerPlugInIOOperationWriteMix, w, &info, buf, NULL);
-            written += w;
-        }
-        AudioServerPlugInIOCycleInfo rin = {0};
-        (*gDrv)->DoIOOperation(gDrv, kDeviceAM, kStreamAM, 2, kAudioServerPlugInIOOperationReadInput, 128, &rin, got + gotN * 2, NULL);
-        gotN += 128;
-        usleep((useconds_t)(128 * 1e6 / rate));
-    }
-    (*gDrv)->StopIO(gDrv, kDeviceAM, 2);
-    (*gDrv)->StopIO(gDrv, kDevice, 1);
-
-    size_t first = 0;
-    while (first < gotN && got[first * 2] == 0 && got[first * 2 + 1] == 0) first++;
-    CHECK(first < gotN, "loopback: the AM input stayed silent");
-    size_t same = 0;
-    if (first < gotN) {
-        size_t avail = gotN - first;
-        size_t cmp = avail < frames ? avail : frames;
-        while (same < cmp && memcmp(got + (first + same) * 2, src + same * 2, 8) == 0) same++;
-        CHECK(same >= frames - 192, "loopback: %zu of %zu frames identical (first diff after frame %zu)", same, frames, same);
-    }
-    pthread_mutex_lock(&gRxMutex);
-    CHECK(gSegCount == 0, "loopback: %d segments went to the network", gSegCount);
-    pthread_mutex_unlock(&gRxMutex);
-    CHECK(status_int(CFSTR("loopFrames")) > 0, "status loopFrames");
-    CHECK(status_int(CFSTR("packets")) == packetsBefore, "loopback counted %lld network packets", status_int(CFSTR("packets")) - packetsBefore);
-
-    /* back to Scream: the network has the audio again, the AM ring stops growing */
-    set_int('SMlb', 0);
-    reset_rx(SCREAM_DIALECT_EXTENDED);
-    long long before = status_int(CFSTR("loopFrames"));
-    (*gDrv)->StartIO(gDrv, kDevice, 1);
-    for (size_t done = 0; done < 8000; done += 512) {
-        float buf[512 * 2];
-        memcpy(buf, src + done * 2, 512 * 8);
-        AudioServerPlugInIOCycleInfo info = {0};
-        (*gDrv)->DoIOOperation(gDrv, kDevice, kStream, 1, kAudioServerPlugInIOOperationWriteMix, 512, &info, buf, NULL);
-        usleep((useconds_t)(512 * 1e6 / rate));
-    }
-    (*gDrv)->StopIO(gDrv, kDevice, 1);
-    usleep(300000);
-    pthread_mutex_lock(&gRxMutex);
-    CHECK(gSegCount >= 1, "after SMlb 0: nothing on the network");
-    pthread_mutex_unlock(&gRxMutex);
-    CHECK(status_int(CFSTR("loopFrames")) == before, "AM frames moved with loopback off");
-    /* a rate change reaches the AM device too */
-    set_format(96000, kFloatFlags, 32);
-    {
-        AudioObjectPropertyAddress ra = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-        Float64 r = 0;
-        UInt32 size = sizeof r;
-        CHECK((*gDrv)->GetPropertyData(gDrv, kDeviceAM, 0, &ra, 0, NULL, size, &size, &r) == 0 && r == 96000, "AM rate after the change: %.0f", r);
-    }
-    if (!failures) printf("ok   %-34s AM input bit-exact (%zu frames), no packets; Scream again after\n", "loopback (SMlb)", same);
-    free(src);
-    free(got);
-    set_int('SMbd', 0);
-    set_int('SMdl', 20);
-}
-
 /* Float32 stream: track A, 50 ms of zeros, track B (Music's inter-track gap). */
 static size_t make_tracks(float **out, size_t *aFrames, size_t *gapFrames, Float64 rate)
 {
@@ -1079,7 +941,6 @@ int main(int argc, char **argv)
     case_music_long_buffers();
     case_gain_fit();
     case_lead_in();
-    case_loopback();
 
     /* settings persisted through the host's storage */
     CHECK(CFDictionaryGetValue(gStorage, CFSTR("destination")) != NULL, "destination not stored");
@@ -1089,7 +950,7 @@ int main(int argc, char **argv)
         long long eots = 0, errs = -1;
         CFNumberGetValue(CFDictionaryGetValue(status, CFSTR("endOfTrackMarkers")), kCFNumberLongLongType, &eots);
         CFNumberGetValue(CFDictionaryGetValue(status, CFSTR("sendErrors")), kCFNumberLongLongType, &errs);
-        CHECK(eots == 27, "status endOfTrackMarkers %lld", eots);
+        CHECK(eots == 25, "status endOfTrackMarkers %lld", eots);
         CHECK(errs == 0, "status sendErrors %lld", errs);
         CFRelease(status);
     }

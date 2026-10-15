@@ -7,7 +7,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 static int failures;
 
@@ -102,51 +101,6 @@ static void test_float_exact(void)
     CHECK(off == 1, "off-grid count %u, want 1", off);
 }
 
-/* pack -> unpack gives back the very same Float32, for every 16- and 24-bit value and every wire layout. */
-static void test_unpack_exact(void)
-{
-    uint8_t w[4];
-    float back;
-    for (int32_t v = -32768; v <= 32767; v++) {
-        float x = (float)v / 32768.0f;
-        scream_pack_float(w, &x, 1, SCREAM_WIRE_S16LE);
-        scream_unpack_float(&back, w, 1, SCREAM_WIRE_S16LE);
-        if (memcmp(&back, &x, 4)) { CHECK(0, "16-bit %d did not come back (%g vs %g)", v, back, x); return; }
-    }
-    static const scream_wire_t w24[] = {SCREAM_WIRE_S24_3LE, SCREAM_WIRE_S24LE};
-    for (unsigned k = 0; k < 2; k++) {
-        for (int32_t v = -8388608; v <= 8388607; v++) {
-            float x = (float)v / 8388608.0f;
-            scream_pack_float(w, &x, 1, w24[k]);
-            scream_unpack_float(&back, w, 1, w24[k]);
-            if (memcmp(&back, &x, 4)) { CHECK(0, "24-bit %d (wire %d) did not come back", v, (int)w24[k]); return; }
-        }
-    }
-    /* 24-bit audio left-aligned in S32 (the original dialect), every 7th value plus the ends */
-    for (int32_t v = -8388608; v <= 8388607; v += (v > 8388500 || v < -8388500) ? 1 : 7) {
-        float x = (float)v / 8388608.0f;
-        scream_pack_float(w, &x, 1, SCREAM_WIRE_S32LE);
-        CHECK(scream_get_le(w, 4) == (int32_t)((uint32_t)v << 8), "S32 left-aligned %d", v);
-        scream_unpack_float(&back, w, 1, SCREAM_WIRE_S32LE);
-        if (memcmp(&back, &x, 4)) { CHECK(0, "24-in-S32 %d did not come back", v); return; }
-    }
-    /* raw bytes: full-scale negative is exactly -1.0, sign extension of 2- and 3-byte values */
-    const uint8_t neg16[] = {0x00, 0x80}, neg24[] = {0x00, 0x00, 0x80}, m1_24[] = {0xff, 0xff, 0xff};
-    scream_unpack_float(&back, neg16, 1, SCREAM_WIRE_S16LE);
-    CHECK(back == -1.0f, "S16 min is %g", back);
-    scream_unpack_float(&back, neg24, 1, SCREAM_WIRE_S24_3LE);
-    CHECK(back == -1.0f, "S24 min is %g", back);
-    scream_unpack_float(&back, m1_24, 1, SCREAM_WIRE_S24_3LE);
-    CHECK(back == -1.0f / 8388608.0f, "S24 -1 is %g", back);
-    /* a whole interleaved block, not just single samples */
-    float blk[8], out[8];
-    uint8_t wire[8 * 3];
-    for (int i = 0; i < 8; i++) blk[i] = (float)((i - 4) * 1000003) / 8388608.0f;
-    scream_pack_float(wire, blk, 8, SCREAM_WIRE_S24_3LE);
-    scream_unpack_float(out, wire, 8, SCREAM_WIRE_S24_3LE);
-    CHECK(memcmp(blk, out, sizeof blk) == 0, "block of 8 did not come back");
-}
-
 static void test_pack_int(void)
 {
     int16_t s16[] = {-32768, -1, 0, 1, 32767};
@@ -178,7 +132,6 @@ int main(void)
 {
     test_headers();
     test_float_exact();
-    test_unpack_exact();
     test_pack_int();
     if (failures) {
         printf("%d failure(s)\n", failures);
