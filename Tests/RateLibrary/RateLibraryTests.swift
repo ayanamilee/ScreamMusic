@@ -114,40 +114,38 @@ struct StartDecisionTests {
     }
 
     @Test func nothingKnownWaits() {
-        #expect(chooseStart(preRoll: nil, scriptRate: 96000, learned: nil, followDepth: true) == nil)
+        #expect(chooseStart(preRoll: nil, scriptRate: 96000, learned: nil) == nil)
     }
 
     @Test func manualStartUsesLibrary() {
-        let c = chooseStart(preRoll: nil, scriptRate: nil, learned: learned(96000, 24), followDepth: true)
+        let c = chooseStart(preRoll: nil, scriptRate: nil, learned: learned(96000, 24))
         #expect(c?.target == hires && c?.source == .library && c?.manualStart == true && c?.candidate == nil)
     }
 
     /// A gapless transition has the track's real format in its pre-roll: it wins over a stale entry,
     /// which stays a candidate for the grid check.
     @Test func preRollOutranksLibrary() {
-        let c = chooseStart(preRoll: cd, scriptRate: nil, learned: learned(96000, 24), followDepth: true)
+        let c = chooseStart(preRoll: cd, scriptRate: nil, learned: learned(96000, 24))
         #expect(c?.target == cd && c?.source == .preRoll && c?.manualStart == false)
         #expect(c?.candidate == hires)
     }
 
     @Test func agreeingLibraryAddsNoCandidate() {
-        let c = chooseStart(preRoll: hires, scriptRate: nil, learned: learned(96000, 24), followDepth: true)
+        let c = chooseStart(preRoll: hires, scriptRate: nil, learned: learned(96000, 24))
         #expect(c?.candidate == nil)
     }
 
     @Test func preRollTakesMusicsHigherRate() {
-        let c = chooseStart(preRoll: cd, scriptRate: 96000, learned: nil, followDepth: true)
+        let c = chooseStart(preRoll: cd, scriptRate: 96000, learned: nil)
         #expect(c?.target == WireFormat(rate: 96000, bits: 16))
     }
 
     @Test func lossyEntryIsIgnored() {
-        #expect(chooseStart(preRoll: nil, scriptRate: nil, learned: learned(48000, 24, lossy: true), followDepth: true) == nil)
+        #expect(chooseStart(preRoll: nil, scriptRate: nil, learned: learned(48000, 24, lossy: true)) == nil)
     }
 
-    @Test func depthFollowingOffUses24() {
-        let c = chooseStart(preRoll: nil, scriptRate: nil, learned: learned(44100, 16), followDepth: false)
-        #expect(c?.target == WireFormat(rate: 44100, bits: 24))
-        let on = chooseStart(preRoll: nil, scriptRate: nil, learned: learned(44100, 16), followDepth: true)
-        #expect(on?.target == cd)
+    @Test func sixteenBitStaysSixteen() {
+        let c = chooseStart(preRoll: nil, scriptRate: nil, learned: learned(44100, 16))
+        #expect(c?.target == cd)
     }
 }

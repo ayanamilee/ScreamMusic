@@ -56,7 +56,6 @@ final class RateFollower: @unchecked Sendable {
     private let q = DispatchQueue(label: "ScreamMusic.follower", qos: .userInitiated)
     private let scripts = MusicScripts()
     private let device: AudioObjectID
-    private let followDepth: Bool
     private var logProcess: Process?
     private var observer: NSObjectProtocol?
 
@@ -108,9 +107,8 @@ final class RateFollower: @unchecked Sendable {
     private var armSerial = 0
     private var stopped = false
 
-    init(device: AudioObjectID, followDepth: Bool) {
+    init(device: AudioObjectID) {
         self.device = device
-        self.followDepth = followDepth
     }
 
     // MARK: - lifecycle
@@ -127,7 +125,7 @@ final class RateFollower: @unchecked Sendable {
         q.async { [self] in
             curRate = ScreamDevice.nominalRate(device) ?? 44100
             curBits = ScreamDevice.getInt(device, ScreamDevice.wireBits).flatMap { $0 == 0 ? nil : $0 } ?? 24
-            elog("follower: started; device at \(Int(curRate)) Hz, wire \(curBits)-bit, depth following \(followDepth ? "on" : "off")")
+            elog("follower: started; device at \(Int(curRate)) Hz, wire \(curBits)-bit")
             guard musicRunning() else { setHold(.gate); watchGate(); return }
             if scripts.playerState() == "playing" {
                 // already playing: treat the current track as new (a short rewind if it needs a switch)
@@ -270,7 +268,7 @@ final class RateFollower: @unchecked Sendable {
         // A pre-roll line (natural transition) outranks the library, which then only backs the grid
         // check; a manual start has no pre-roll, so the library saves the wait for the decoder line.
         let preRollBest = preRoll.compactMap({ fmt(rate: $0.rate, bits: $0.bits) }).reduce(nil, { Fmt.best($0, $1) })
-        if let choice = chooseStart(preRoll: preRollBest, scriptRate: scriptRate, learned: learned, followDepth: followDepth) {
+        if let choice = chooseStart(preRoll: preRollBest, scriptRate: scriptRate, learned: learned) {
             if let c = choice.candidate {
                 maybeFormats.append(c)
                 libraryCandidate = true
@@ -300,7 +298,7 @@ final class RateFollower: @unchecked Sendable {
     /// The wire format for a lossless line, nil for a 'qlac' line without the depth.
     private func fmt(rate: Double, bits: Int?) -> Fmt? {
         guard let b = Self.wireBits(bits) else { return nil }
-        return Fmt(rate: rate, bits: followDepth ? b : 24)
+        return Fmt(rate: rate, bits: b)
     }
 
     /// The current track as Music reports it, if it is `name` (~1 s of retries: it reads
