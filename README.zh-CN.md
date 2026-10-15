@@ -10,9 +10,13 @@ macOS 菜单栏应用，带一个小音频驱动。系统里多一块名为 **Sc
 
 [Releases](https://github.com/ayanamilee/ScreamMusic/releases) 里的 zip。ad-hoc 签名，未公证：解压后右键 App → 打开。
 
+这条分支请用 **0.5.2**。0.5.0 和 0.5.1 的设备时钟走慢（大约只有实时的三分之二），接收端会欠载。`main` 仍是 0.4.8，等这版稳定再合并。
+
 ## 两种用法
 
 在面板的 Receiver 下拉框里选一种，互斥。
+
+来回切换不用重启 Apple Music。它一直写进 ScreamMusic，变的只是声音接下来去网络还是去 ScreamMusic AM。
 
 ### Scream（网络）
 

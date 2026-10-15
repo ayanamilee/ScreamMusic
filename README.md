@@ -10,9 +10,13 @@ Requires macOS 26 or later. Protocol-compatible with [screamalsa](https://github
 
 The zip in [Releases](https://github.com/ayanamilee/ScreamMusic/releases). Ad-hoc signed, not notarized: unzip, right-click the app, Open.
 
+On this branch, use **0.5.2**. 0.5.0 and 0.5.1 made the device clock run slow (about two thirds of real time), so the receiver underrunned. `main` stays on 0.4.8 until this is ready to merge.
+
 ## Two ways to use it
 
 The Receiver dropdown in the panel picks one. They are exclusive.
+
+Switching does not restart Apple Music. It keeps playing into ScreamMusic; only where that sound goes next changes.
 
 ### Scream (network)
 

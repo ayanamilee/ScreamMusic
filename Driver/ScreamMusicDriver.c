@@ -1271,7 +1271,15 @@ static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef i
         gClockSeed++;
         begin_run_locked();
     }
+    /* AM reads the same gRate. Retiming it here avoids a second config change during this one. */
+    if (gIOCount_AM) {
+        gAnchorHost_AM = mach_absolute_time();
+        gNumTimeStamps_AM = 0;
+        gClockSeed_AM++;
+        gLoopStarted = false;
+    }
     pthread_mutex_unlock(&gIOMutex);
+    notify(kObjectID_Device_AM, kAudioDevicePropertyNominalSampleRate);
     return 0;
 }
 
@@ -1279,6 +1287,7 @@ static OSStatus SM_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inD
 {
     (void)action; (void)info;
     if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
+    if (inDevice != kObjectID_Device) return 0;   /* an AM abort must not drop the main device's pending rate */
     pthread_mutex_lock(&gStateMutex);
     gPendingRate = 0;
     gPendingFormat = -1;
@@ -1606,13 +1615,9 @@ static bool cf_int(CFPropertyListRef p, int *out)
 static OSStatus request_change(void)
 {
     if (!gHost) return 0;
-    pthread_mutex_lock(&gStateMutex);
-    bool rate = gPendingRate > 0;
-    pthread_mutex_unlock(&gStateMutex);
-    OSStatus st = gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, 0, NULL);
-    /* the AM input follows a rate change (a wire-depth change alone does not concern it) */
-    if (rate) gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device_AM, 0, NULL);
-    return st;
+    /* Only the main device. A second request shares gPendingRate; the HAL can abort the first
+     * change and clear it, so the clock is never retimed (0.5.0/0.5.1: IO ran at ~2/3 speed). */
+    return gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, 0, NULL);
 }
 
 static OSStatus device_set(AudioObjectID dev, const AudioObjectPropertyAddress *a, UInt32 inDataSize, const void *inData)
@@ -1982,13 +1987,18 @@ static OSStatus SM_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioOb
     if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     if (inDevice == kObjectID_Device_AM) {
         pthread_mutex_lock(&gIOMutex);
+        if (gAnchorHost_AM == 0) {
+            /* never started: a host time of 0 is TimeStampOutOfLine and resets the main device clock */
+            gAnchorHost_AM = mach_absolute_time();
+            gNumTimeStamps_AM = 0;
+        }
         UInt64 nowAM = mach_absolute_time();
         Float64 ticksAM = gHostTicksPerFrame * kZeroTimeStampPeriod;
         UInt64 nextAM = gAnchorHost_AM + (UInt64)((Float64)(gNumTimeStamps_AM + 1) * ticksAM);
         if (nextAM <= nowAM) gNumTimeStamps_AM++;
         *outSampleTime = (Float64)(gNumTimeStamps_AM * kZeroTimeStampPeriod);
         *outHostTime = gAnchorHost_AM + (UInt64)((Float64)gNumTimeStamps_AM * ticksAM);
-        *outSeed = gClockSeed_AM;
+        *outSeed = gClockSeed_AM ? gClockSeed_AM : 1;
         pthread_mutex_unlock(&gIOMutex);
         return 0;
     }
