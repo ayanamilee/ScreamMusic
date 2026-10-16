@@ -93,7 +93,7 @@ typedef enum { kFmt_Float32 = 0, kFmt_SInt16, kFmt_SInt24, kFmt_SInt32, kNumForm
 #define kLeadOnceSec          3            /* SMlo: how long it waits for the format change it was set for */
 #define kRingBytes            (1u << 22)   /* 4 MiB: > 1 s at 384 kHz S32 stereo */
 #define kMaxClients           64
-#define kClientSlots          256          /* client ID -> pid, read on the IO thread */
+#define kClientSlots          256          /* open-addressed client ID -> pid; IO thread only reads */
 #define kOthersFrames         65536u       /* others loopback, indexed by sample time */
 #define kHoldTimeoutSec       4            /* a gate/boundary hold left by the app is released */
 #define kDropTimeoutSec       10
@@ -149,6 +149,13 @@ static Float64 gRate = 44100;
 static fmt_t gFormat = kFmt_Float32;
 static Float64 gPendingRate;
 static int gPendingFormat = -1;
+/* AM's own rate, changed only inside AM's configuration change. The host compares a device's
+ * properties before and after its Perform to see what changed. AM used to report the shared
+ * gRate, which the main device's change had already moved, so the host saw "no change" and kept
+ * driving AM's IO at its first rate (44.1 kHz while it reported 96 kHz: ~0.58x, a stutter).
+ * Its own pending value, so it never shares one with the main device (the 0.5.0 bug). */
+static Float64 gRate_AM = 44100;
+static Float64 gPendingRate_AM;
 static struct {
     pid_t pid;
     UInt32 clientID;
@@ -200,6 +207,7 @@ static UInt64 gAnchorHost_AM;
 static UInt64 gNumTimeStamps_AM;
 static UInt64 gClockSeed_AM = 1;
 static Float64 gHostTicksPerFrame;
+static Float64 gHostTicksPerFrame_AM;      /* from gRate_AM */
 static Float64 gHostTicksPerSecond;
 
 /* Stream snapshot, published at the start of each run (StartIO, or a configuration change while
@@ -225,6 +233,9 @@ static _Atomic uint64_t gLoopW;            /* frames written */
 static _Atomic unsigned gLoopFlush;        /* bumped when the stream's wire format changes */
 static _Atomic bool gLoopback;
 static _Atomic uint64_t gStatLoopFrames, gStatLoopUnderruns, gStatLoopSkips;
+/* AM configuration change diagnostics: requested, its status, performed, aborted, IO starts */
+static _Atomic uint64_t gDiagAMReq, gDiagAMPerf, gDiagAMAbort, gDiagAMStart;
+static _Atomic int gDiagAMReqStatus;
 static uint64_t gLoopR;                    /* consumer only: frames read */
 static unsigned gLoopSeenFlush;
 static bool gLoopStarted;
@@ -352,10 +363,62 @@ static void notify(AudioObjectID obj, AudioObjectPropertySelector sel)
     gHost->PropertiesChanged(gHost, obj, 1, &a);
 }
 
+static uint32_t client_slot_id(uint64_t v)
+{
+    return (uint32_t)(v >> 32);
+}
+
+/* Open addressing, not clientID % 256. A later client with the same remainder used to
+ * overwrite Music. A rate change re-registers the others player, and from then on Music
+ * was treated as another app: its audio went to the monitor and the loopback stayed empty.
+ * A tombstone keeps a deleted slot from hiding the entries probed after it. */
+enum { kClientEmpty = 0u, kClientTomb = 0xffffffffu };
+
 static pid_t client_pid(UInt32 clientID)
 {
-    uint64_t v = atomic_load_explicit(&gClientPIDs[clientID % kClientSlots], memory_order_acquire);
-    return (v >> 32) == clientID ? (pid_t)(uint32_t)v : 0;
+    if (clientID == kClientEmpty || clientID == kClientTomb) return 0;
+    for (UInt32 i = 0; i < kClientSlots; i++) {
+        uint64_t v = atomic_load_explicit(&gClientPIDs[(clientID + i) % kClientSlots], memory_order_acquire);
+        uint32_t id = client_slot_id(v);
+        if (id == kClientEmpty) return 0;
+        if (id == clientID) return (pid_t)(uint32_t)v;
+    }
+    return 0;
+}
+
+static void client_pid_set(UInt32 clientID, pid_t pid)
+{
+    if (clientID == kClientEmpty || clientID == kClientTomb) return;
+    uint64_t neu = ((uint64_t)clientID << 32) | (uint32_t)pid;
+    UInt32 tomb = kClientSlots;
+    for (UInt32 i = 0; i < kClientSlots; i++) {
+        UInt32 s = (clientID + i) % kClientSlots;
+        uint32_t id = client_slot_id(atomic_load(&gClientPIDs[s]));
+        if (id == clientID) { atomic_store(&gClientPIDs[s], neu); return; }
+        if (id == kClientTomb && tomb == kClientSlots) tomb = s;
+        if (id == kClientEmpty) {
+            atomic_store(&gClientPIDs[tomb == kClientSlots ? s : tomb], neu);
+            return;
+        }
+    }
+    if (tomb < kClientSlots) atomic_store(&gClientPIDs[tomb], neu);
+    else if (gLog) os_log_error(gLog, "ScreamMusic: client table full, pid %d not recorded", (int)pid);
+}
+
+static void client_pid_clear(UInt32 clientID, pid_t pid)
+{
+    if (clientID == kClientEmpty || clientID == kClientTomb) return;
+    uint64_t want = ((uint64_t)clientID << 32) | (uint32_t)pid;
+    uint64_t tomb = (uint64_t)kClientTomb << 32;
+    for (UInt32 i = 0; i < kClientSlots; i++) {
+        UInt32 s = (clientID + i) % kClientSlots;
+        uint32_t id = client_slot_id(atomic_load(&gClientPIDs[s]));
+        if (id == kClientEmpty) return;
+        if (id == clientID) {
+            atomic_compare_exchange_strong(&gClientPIDs[s], &want, tomb);
+            return;
+        }
+    }
 }
 
 static void set_hold(int mode)
@@ -536,6 +599,11 @@ static CFDictionaryRef copy_status(void)
     dict_set_u64(d, CFSTR("loopFrames"), atomic_load(&gStatLoopFrames));
     dict_set_u64(d, CFSTR("loopUnderruns"), atomic_load(&gStatLoopUnderruns));
     dict_set_u64(d, CFSTR("loopSkips"), atomic_load(&gStatLoopSkips));
+    dict_set_u64(d, CFSTR("diagAMRequested"), atomic_load(&gDiagAMReq));
+    dict_set_u64(d, CFSTR("diagAMRequestStatus"), (uint64_t)(uint32_t)atomic_load(&gDiagAMReqStatus));
+    dict_set_u64(d, CFSTR("diagAMPerformed"), atomic_load(&gDiagAMPerf));
+    dict_set_u64(d, CFSTR("diagAMAborted"), atomic_load(&gDiagAMAbort));
+    dict_set_u64(d, CFSTR("diagAMStartIO"), atomic_load(&gDiagAMStart));
     dict_set_u64(d, CFSTR("musicPID"), (uint64_t)atomic_load(&gMusicPID));
     dict_set_u64(d, CFSTR("ownerPID"), (uint64_t)atomic_load(&gOwnerPID));
     dict_set_u64(d, CFSTR("holdMode"), (uint64_t)atomic_load(&gHoldMode));
@@ -1171,6 +1239,11 @@ static void update_clock_rate(void)
     gHostTicksPerFrame = gHostTicksPerSecond / gRate;
 }
 
+static void update_clock_rate_AM(void)
+{
+    gHostTicksPerFrame_AM = gHostTicksPerSecond / gRate_AM;
+}
+
 static OSStatus SM_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost)
 {
     if (inDriver != gDriverRef) return kAudioHardwareBadObjectError;
@@ -1180,6 +1253,7 @@ static OSStatus SM_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPl
     mach_timebase_info(&tb);
     gHostTicksPerSecond = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
     update_clock_rate();
+    update_clock_rate_AM();
     load_settings();
     start_sender();
     os_log(gLog, "ScreamMusic: driver initialized");
@@ -1212,8 +1286,7 @@ static OSStatus SM_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObj
             CFStringGetCString(info->mBundleID, gClients[gClientCount].bundle, sizeof gClients[0].bundle, kCFStringEncodingUTF8);
         gClientCount++;
     }
-    atomic_store_explicit(&gClientPIDs[info->mClientID % kClientSlots],
-                          ((uint64_t)info->mClientID << 32) | (uint32_t)info->mProcessID, memory_order_release);
+    client_pid_set(info->mClientID, info->mProcessID);
     pthread_mutex_unlock(&gStateMutex);
     return 0;
 }
@@ -1230,8 +1303,7 @@ static OSStatus SM_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, Audio
             break;
         }
     }
-    uint64_t want = ((uint64_t)info->mClientID << 32) | (uint32_t)info->mProcessID;
-    atomic_compare_exchange_strong(&gClientPIDs[info->mClientID % kClientSlots], &want, 0);
+    client_pid_clear(info->mClientID, info->mProcessID);
     pthread_mutex_unlock(&gStateMutex);
     return 0;
 }
@@ -1241,19 +1313,21 @@ static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef i
     (void)action; (void)info;
     if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gIOMutex);
-    pthread_mutex_lock(&gStateMutex);
-    if (gPendingRate > 0) {
-        gRate = gPendingRate;
-        gPendingRate = 0;
-    }
-    if (gPendingFormat >= 0) {
-        gFormat = (fmt_t)gPendingFormat;
-        gPendingFormat = -1;
-    }
-    update_clock_rate();
-    os_log(gLog, "ScreamMusic: now %.0f Hz, format %d", gRate, (int)gFormat);
-    pthread_mutex_unlock(&gStateMutex);
-    if (inDevice == kObjectID_Device_AM) {     /* the same rate, its own clock and reader */
+    if (inDevice == kObjectID_Device_AM) {
+        /* The main device already applied the rate. The HAL drives AM's IO at the rate it last
+         * configured AM with, so AM needs its own change: without it, AM kept running at the
+         * rate it started with (44.1 kHz) after a switch to 96 kHz and HQPlayer stuttered.
+         * Never touch gPendingRate here; that was the 0.5.0/0.5.1 bug. */
+        pthread_mutex_lock(&gStateMutex);
+        if (gPendingRate_AM > 0) {
+            gRate_AM = gPendingRate_AM;
+            gPendingRate_AM = 0;
+        }
+        update_clock_rate_AM();
+        Float64 amRate = gRate_AM;
+        pthread_mutex_unlock(&gStateMutex);
+        atomic_fetch_add(&gDiagAMPerf, 1);
+        os_log(gLog, "ScreamMusic: AM configuration change performed: now %.0f Hz (IO count %u)", amRate, gIOCount_AM);
         if (gIOCount_AM) {
             gAnchorHost_AM = mach_absolute_time();
             gNumTimeStamps_AM = 0;
@@ -1264,22 +1338,41 @@ static OSStatus SM_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef i
         pthread_mutex_unlock(&gIOMutex);
         return 0;
     }
+    pthread_mutex_lock(&gStateMutex);
+    bool rateChanged = false;
+    if (gPendingRate > 0) {
+        rateChanged = gPendingRate != gRate;
+        gRate = gPendingRate;
+        gPendingRate = 0;
+    }
+    if (gPendingFormat >= 0) {
+        gFormat = (fmt_t)gPendingFormat;
+        gPendingFormat = -1;
+    }
+    update_clock_rate();
+    os_log(gLog, "ScreamMusic: now %.0f Hz, format %d", gRate, (int)gFormat);
+    pthread_mutex_unlock(&gStateMutex);
     /* IO may resume without a new StartIO: restart the clock and the run with the new format */
     if (gIOCount) {
         gAnchorHost = mach_absolute_time();
         gNumTimeStamps = 0;
         gClockSeed++;
+        atomic_store(&gMusicCoveredUntil, INT64_MIN);   /* sample time restarts; the old coverage is meaningless */
         begin_run_locked();
     }
-    /* AM reads the same gRate. Retiming it here avoids a second config change during this one. */
-    if (gIOCount_AM) {
-        gAnchorHost_AM = mach_absolute_time();
-        gNumTimeStamps_AM = 0;
-        gClockSeed_AM++;
-        gLoopStarted = false;
-    }
     pthread_mutex_unlock(&gIOMutex);
-    notify(kObjectID_Device_AM, kAudioDevicePropertyNominalSampleRate);
+    /* AM's own change, requested only after the main one is done, so the two never share a
+     * pending rate. A notification alone left the HAL running AM at its old rate. */
+    pthread_mutex_lock(&gStateMutex);
+    bool amBehind = gRate_AM != gRate;
+    if (amBehind) gPendingRate_AM = gRate;
+    pthread_mutex_unlock(&gStateMutex);
+    if ((rateChanged || amBehind) && gHost) {
+        OSStatus st = gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device_AM, 0, NULL);
+        atomic_fetch_add(&gDiagAMReq, 1);
+        atomic_store(&gDiagAMReqStatus, (int)st);
+        os_log(gLog, "ScreamMusic: AM configuration change requested for %.0f Hz: status %d", gRate, (int)st);
+    }
     return 0;
 }
 
@@ -1287,7 +1380,11 @@ static OSStatus SM_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inD
 {
     (void)action; (void)info;
     if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
-    if (inDevice != kObjectID_Device) return 0;   /* an AM abort must not drop the main device's pending rate */
+    if (inDevice != kObjectID_Device) {           /* an AM abort must not drop the main device's pending rate */
+        atomic_fetch_add(&gDiagAMAbort, 1);
+        os_log(gLog, "ScreamMusic: AM configuration change aborted");
+        return 0;
+    }
     pthread_mutex_lock(&gStateMutex);
     gPendingRate = 0;
     gPendingFormat = -1;
@@ -1550,7 +1647,7 @@ static OSStatus device_get(AudioObjectID dev, const AudioObjectPropertyAddress *
     case kAudioDevicePropertyZeroTimeStampPeriod: WRITE_VALUE(UInt32, kZeroTimeStampPeriod); return 0;
     case kAudioDevicePropertyNominalSampleRate: {
         pthread_mutex_lock(&gStateMutex);
-        Float64 r = gRate;
+        Float64 r = dev == kObjectID_Device_AM ? gRate_AM : gRate;
         pthread_mutex_unlock(&gStateMutex);
         WRITE_VALUE(Float64, r);
         return 0;
@@ -1798,7 +1895,7 @@ static OSStatus stream_get(bool input, AudioObjectID owner, const AudioObjectPro
     case kAudioStreamPropertyPhysicalFormat: {
         if (inDataSize < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
         pthread_mutex_lock(&gStateMutex);
-        fill_asbd(outData, gRate, input ? kFmt_Float32 : gFormat);
+        fill_asbd(outData, owner == kObjectID_Device_AM ? gRate_AM : gRate, input ? kFmt_Float32 : gFormat);
         pthread_mutex_unlock(&gStateMutex);
         *outDataSize = sizeof(AudioStreamBasicDescription);
         return 0;
@@ -1920,14 +2017,13 @@ static OSStatus SM_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObj
     return kAudioHardwareBadObjectError;
 }
 
-/* ---- IO ---------------------------------------------------------------------- */
-
 static OSStatus SM_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevice, UInt32 client)
 {
     (void)client;
     if (inDriver != gDriverRef || (inDevice != kObjectID_Device && inDevice != kObjectID_Device_AM)) return kAudioHardwareBadObjectError;
     if (inDevice == kObjectID_Device_AM) {
         pthread_mutex_lock(&gIOMutex);
+        atomic_fetch_add(&gDiagAMStart, 1);
         if (gIOCount_AM++ == 0) {
             gNumTimeStamps_AM = 0;
             gAnchorHost_AM = mach_absolute_time();
@@ -1993,7 +2089,7 @@ static OSStatus SM_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioOb
             gNumTimeStamps_AM = 0;
         }
         UInt64 nowAM = mach_absolute_time();
-        Float64 ticksAM = gHostTicksPerFrame * kZeroTimeStampPeriod;
+        Float64 ticksAM = gHostTicksPerFrame_AM * kZeroTimeStampPeriod;
         UInt64 nextAM = gAnchorHost_AM + (UInt64)((Float64)(gNumTimeStamps_AM + 1) * ticksAM);
         if (nextAM <= nowAM) gNumTimeStamps_AM++;
         *outSampleTime = (Float64)(gNumTimeStamps_AM * kZeroTimeStampPeriod);
